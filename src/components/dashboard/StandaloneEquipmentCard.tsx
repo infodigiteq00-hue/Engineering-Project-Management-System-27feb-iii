@@ -2468,35 +2468,39 @@ const StandaloneEquipmentCard: React.FC<StandaloneEquipmentCardProps> = (props) 
                         {editingEquipmentId === item.id ? (
                           // Edit Mode - Upload Documents
                           <div className="space-y-3">
-                            <div className="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center">
-                              <FileText size={24} className="mx-auto text-gray-400 mb-2" />
-                              <div className="text-sm text-gray-600">
-                                Click to upload documents
-                              </div>
-                              <div className="text-xs text-gray-500 mt-1">
-                                PDF, DOC, XLS, DWG, Images supported
-                              </div>
+                            <div className="border-2 border-dashed border-gray-300 rounded-lg bg-gray-50 p-6 text-center" onClick={e => e.stopPropagation()}>
+                              <input
+                                type="file"
+                                multiple
+                                accept=".pdf,.doc,.docx,.xls,.xlsx,.dwg,.dxf,.jpg,.jpeg,.png,image/*"
+                                onChange={(e) => {
+                                  const files = Array.from(e.target.files || []);
+                                  if (files.length > 0) handleDocumentUpload(item.id, files);
+                                  e.target.value = '';
+                                }}
+                                className="hidden"
+                                id={`doc-upload-${item.id}`}
+                              />
+                              <label
+                                htmlFor={`doc-upload-${item.id}`}
+                                className="cursor-pointer flex flex-col items-center justify-center gap-1.5 py-3 text-gray-600 hover:text-gray-800"
+                                onClick={e => e.stopPropagation()}
+                              >
+                                <FileText size={28} className="mx-auto text-gray-400" strokeWidth={1.5} />
+                                <div className="text-sm font-medium text-gray-600">Click to upload documents</div>
+                                <div className="text-xs text-gray-500">PDF, DOC, XLS, DWG, Images supported</div>
+                              </label>
                             </div>
-
-                            {/* Simple File Input */}
                             {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && currentUserRole !== 'editor' && (
-                              <div className="mt-2">
-                                <input
-                                  type="file"
-                                  multiple
-                                  accept=".pdf,.doc,.docx,.xls,.xlsx,.dwg,.dxf,.jpg,.jpeg,.png"
-                                  onChange={(e) => {
-                                    // // console.log('ðŸš€ SIMPLE: File input changed!');
-                                    // // console.log('ðŸš€ SIMPLE: Files:', e.target.files);
-                                    const files = Array.from(e.target.files || []);
-                                    // // console.log('ðŸš€ SIMPLE: Files array:', files);
-                                    if (files.length > 0) {
-                                      // // console.log('ðŸš€ SIMPLE: Starting upload...');
-                                      handleDocumentUpload(item.id, files);
-                                    }
-                                  }}
-                                  className="w-full text-xs"
-                                />
+                              <div className="flex flex-row items-center gap-2" onClick={e => e.stopPropagation()}>
+                                <label
+                                  htmlFor={`doc-upload-${item.id}`}
+                                  className="cursor-pointer inline-block rounded border border-gray-300 bg-gray-100 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-200"
+                                  onClick={e => e.stopPropagation()}
+                                >
+                                  Choose Files
+                                </label>
+                                <span className="text-sm text-gray-500">No file chosen</span>
                               </div>
                             )}
 
@@ -2507,7 +2511,7 @@ const StandaloneEquipmentCard: React.FC<StandaloneEquipmentCardProps> = (props) 
                               ) || [];
                               if (equipmentDocs.length === 0) return null;
                               return (
-                                <div className="mt-2 p-3 bg-green-50 border border-green-200 rounded-md">
+                                <div className="mt-2 p-3 bg-green-50 border border-green-200 border-t-2 border-t-green-300 rounded-md">
                                   <p className="text-sm font-medium text-green-800 mb-2">Existing Equipment Documents:</p>
                                   <div className="space-y-1">
                                     {equipmentDocs.map((doc) => (

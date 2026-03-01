@@ -185,6 +185,43 @@ export const activityApi = {
     }
   },
 
+  /** Batch fetch equipment activity logs for many project IDs in one (or few) request(s). */
+  async getEquipmentActivityLogsBatch(projectIds: string[], filters?: {
+    equipmentId?: string;
+    activityType?: string;
+    userId?: string;
+    dateFrom?: string;
+    dateTo?: string;
+    limit?: number;
+    offset?: number;
+  }) {
+    if (!projectIds?.length) return [];
+    try {
+      const BATCH_CHUNK = 30;
+      const allLogs: any[] = [];
+      for (let i = 0; i < projectIds.length; i += BATCH_CHUNK) {
+        const chunk = projectIds.slice(i, i + BATCH_CHUNK);
+        let query = `/equipment_activity_logs?project_id=in.(${chunk.join(',')})`;
+        if (filters?.equipmentId) query += `&equipment_id=eq.${filters.equipmentId}`;
+        if (filters?.activityType) query += `&activity_type=eq.${filters.activityType}`;
+        if (filters?.userId) query += `&created_by=eq.${filters.userId}`;
+        if (filters?.dateFrom) query += `&created_at=gte.${filters.dateFrom}`;
+        if (filters?.dateTo) query += `&created_at=lte.${filters.dateTo}`;
+        query += `&order=created_at.desc`;
+        query += `&limit=${filters?.limit ?? 500}`;
+        if (filters?.offset) query += `&offset=${filters.offset}`;
+        query += `&select=*,equipment:equipment_id(id,tag_number,type,name,project_id),created_by_user:created_by(full_name,email)`;
+        const response = await api.get(query);
+        const logs = Array.isArray(response.data) ? response.data : [];
+        allLogs.push(...logs);
+      }
+      return allLogs;
+    } catch (error: any) {
+      console.error('❌ activityApi: Error fetching equipment activity logs batch:', error);
+      return [];
+    }
+  },
+
   // Get activity logs for specific equipment
   async getEquipmentActivityLogsByEquipment(equipmentId: string, filters?: {
     activityType?: string;

@@ -31,12 +31,16 @@ interface VDCRRevisionHistoryProps {
   documentName: string;
   currentRevision?: string; // Current revision number from VDCR record
   documentUrl?: string; // Current document URL
-  projectId?: string; // Project ID to fetch latest revision
+  projectId?: string; // Project ID to fetch latest revision (only when preloaded* not provided)
   projectDocumentationStartDate?: string | null; // Custom documentation start date for this VDCR entry
   targetedFinishDate?: string | null; // Target completion date for this VDCR document
   isOpen: boolean;
   onClose: () => void;
   onDocumentClick?: (url: string, name: string) => void; // Callback for document click
+  /** When provided, no API calls for revision events (avoids 1 request). */
+  preloadedRevisionEvents?: RevisionEvent[] | null;
+  /** When provided, no API calls for project/latest revision (avoids 6 requests). */
+  preloadedProjectData?: { sales_order_date?: string; vdcr_cycle_time_rev_00?: number | null } | null;
 }
 
 const VDCRRevisionHistory: React.FC<VDCRRevisionHistoryProps> = ({
@@ -49,7 +53,9 @@ const VDCRRevisionHistory: React.FC<VDCRRevisionHistoryProps> = ({
   targetedFinishDate,
   isOpen,
   onClose,
-  onDocumentClick
+  onDocumentClick,
+  preloadedRevisionEvents,
+  preloadedProjectData
 }) => {
   const { toast } = useToast();
   const [events, setEvents] = useState<RevisionEvent[]>([]);
@@ -61,12 +67,29 @@ const VDCRRevisionHistory: React.FC<VDCRRevisionHistoryProps> = ({
   } | null>(null);
 
   useEffect(() => {
-    if (isOpen && vdcrRecordId) {
+    if (!isOpen || !vdcrRecordId) return;
+    const hasPreloadedEvents = preloadedRevisionEvents != null && Array.isArray(preloadedRevisionEvents);
+    const hasPreloadedProject = preloadedProjectData != null && typeof preloadedProjectData === 'object';
+
+    if (hasPreloadedEvents) {
+      setEvents(preloadedRevisionEvents);
+      setIsLoading(false);
+    } else {
       loadRevisionEvents();
+    }
+
+    if (currentRevision) {
+      setLatestRevision(currentRevision);
+    } else if (projectId) {
       loadLatestRevision();
+    }
+
+    if (hasPreloadedProject) {
+      setProjectData(preloadedProjectData);
+    } else if (projectId) {
       loadProjectData();
     }
-  }, [isOpen, vdcrRecordId, currentRevision, projectDocumentationStartDate]);
+  }, [isOpen, vdcrRecordId, currentRevision, projectDocumentationStartDate, preloadedRevisionEvents, preloadedProjectData]);
 
   // Update latest revision when currentRevision prop changes
   useEffect(() => {

@@ -4195,7 +4195,7 @@ Industry: Petrochemical`;
               type="file"
               multiple
               onChange={(e) => handleFileUpload('unpricedPOFile', e.target.files && e.target.files.length ? Array.from(e.target.files) : null)}
-              className="flex items-center text-xs sm:text-sm border-gray-300 focus:border-blue-500 focus:ring-blue-500 transition-all duration-200 h-9 sm:h-10 leading-9 sm:leading-10 py-0 file:mr-2"
+              className="flex items-center text-xs sm:text-sm border-gray-300 focus:border-blue-500 focus:ring-blue-500 transition-all duration-200 h-9 sm:h-10 leading-9 sm:leading-10 py-0 file:mr-2 md:flex md:items-center md:file:flex md:file:items-center md:file:h-full"
             />
             <p className="text-xs text-gray-500">You can select multiple files at once</p>
             {/* Display existing Unpriced PO documents */}
@@ -4242,7 +4242,7 @@ Industry: Petrochemical`;
               type="file"
               multiple
               onChange={(e) => handleFileUpload('designInputsPID', e.target.files && e.target.files.length ? Array.from(e.target.files) : null)}
-              className="flex items-center text-xs sm:text-sm border-gray-300 focus:border-blue-500 focus:ring-blue-500 transition-all duration-200 h-8 sm:h-10 leading-8 sm:leading-10 py-0 file:mr-2"
+              className="flex items-center text-xs sm:text-sm border-gray-300 focus:border-blue-500 focus:ring-blue-500 transition-all duration-200 h-8 sm:h-10 leading-8 sm:leading-10 py-0 file:mr-2 md:flex md:items-center md:file:flex md:file:items-center md:file:h-full"
             />
             <p className="text-xs text-gray-500">You can select multiple files at once</p>
             {/* Display existing Design Inputs documents */}
@@ -4289,7 +4289,7 @@ Industry: Petrochemical`;
               type="file"
               multiple
               onChange={(e) => handleFileUpload('clientReferenceDoc', e.target.files && e.target.files.length ? Array.from(e.target.files) : null)}
-              className="flex items-center text-xs sm:text-sm border-gray-300 focus:border-blue-500 focus:ring-blue-500 transition-all duration-200 h-8 sm:h-10 leading-8 sm:leading-10 py-0 file:mr-2"
+              className="flex items-center text-xs sm:text-sm border-gray-300 focus:border-blue-500 focus:ring-blue-500 transition-all duration-200 h-8 sm:h-10 leading-8 sm:leading-10 py-0 file:mr-2 md:flex md:items-center md:file:flex md:file:items-center md:file:h-full"
             />
             <p className="text-xs text-gray-500">You can select multiple files at once</p>
             {/* Display existing Client Reference documents */}
@@ -4336,7 +4336,7 @@ Industry: Petrochemical`;
               type="file"
               multiple
               onChange={(e) => handleFileUpload('otherDocuments', e.target.files && e.target.files.length ? Array.from(e.target.files) : null)}
-              className="flex items-center text-xs sm:text-sm border-gray-300 focus:border-blue-500 focus:ring-blue-500 transition-all duration-200 h-8 sm:h-10 leading-8 sm:leading-10 py-0 file:mr-2"
+              className="flex items-center text-xs sm:text-sm border-gray-300 focus:border-blue-500 focus:ring-blue-500 transition-all duration-200 h-8 sm:h-10 leading-8 sm:leading-10 py-0 file:mr-2 md:flex md:items-center md:file:flex md:file:items-center md:file:h-full"
             />
             <p className="text-xs text-gray-500">You can select multiple files at once</p>
             {/* Display existing Other documents */}

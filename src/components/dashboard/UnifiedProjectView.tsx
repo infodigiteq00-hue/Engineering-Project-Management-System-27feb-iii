@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -222,6 +222,9 @@ const UnifiedProjectView = ({
   const [isLoadingVDCR, setIsLoadingVDCR] = useState(false);
   const [equipmentProgressEntries, setEquipmentProgressEntries] = useState<any[]>([]);
   const [isLoadingEquipmentLogs, setIsLoadingEquipmentLogs] = useState(false);
+  const vdcrLoadedForProjectRef = useRef<string | null>(null);
+  const teamLoadedForProjectRef = useRef<string | null>(null);
+  const equipmentLogsLoadedForProjectRef = useRef<string | null>(null);
   const [previewModal, setPreviewModal] = useState({
     isOpen: false,
     documentUrl: '',
@@ -268,6 +271,7 @@ const UnifiedProjectView = ({
       setVdcrDocuments([]);
     } finally {
       setIsLoadingVDCR(false);
+      vdcrLoadedForProjectRef.current = projectId;
     }
   };
 
@@ -291,6 +295,7 @@ const UnifiedProjectView = ({
       setEquipmentProgressEntries([]);
     } finally {
       setIsLoadingEquipmentLogs(false);
+      equipmentLogsLoadedForProjectRef.current = projectId;
     }
   };
 
@@ -325,6 +330,7 @@ const UnifiedProjectView = ({
       // // console.log('✅ Transformed project members:', transformedMembers.length);
       // // console.log('✅ Team members details:', transformedMembers);
       setTeamMembers(transformedMembers);
+      teamLoadedForProjectRef.current = projectId;
     } catch (error) {
       // console.error('❌ Error fetching team members:', error);
       setTeamMembers([]);
@@ -382,16 +388,24 @@ const UnifiedProjectView = ({
     return roleAccess[role] || ['Read-Only Access'];
   };
 
-  // Fetch team members on component mount and when project changes
+  // Load tab data only when user opens that tab (keeps equipment view ~9 requests; no VDCR/team/logs until clicked)
   useEffect(() => {
-    if (projectId) {
-      // PERFORMANCE: Console logs commented out - uncomment if needed for debugging
-      // // console.log('🔄 Project ID changed, fetching team members for:', projectId);
-      fetchTeamMembers();
-      loadVDCRData();
-      loadEquipmentProgressEntries();
-    }
-  }, [projectId, projectData?.id]);
+    if (!projectId || activeTab !== 'settings') return;
+    if (teamLoadedForProjectRef.current === projectId) return;
+    fetchTeamMembers();
+  }, [projectId, activeTab, projectData?.id]);
+
+  useEffect(() => {
+    if (!projectId || activeTab !== 'vdcr') return;
+    if (vdcrLoadedForProjectRef.current === projectId) return;
+    loadVDCRData();
+  }, [projectId, activeTab, projectData?.id]);
+
+  useEffect(() => {
+    if (!projectId || activeTab !== 'equipment-activity') return;
+    if (equipmentLogsLoadedForProjectRef.current === projectId) return;
+    loadEquipmentProgressEntries();
+  }, [projectId, activeTab, projectData?.id]);
 
   // Listen for team member creation events
   useEffect(() => {

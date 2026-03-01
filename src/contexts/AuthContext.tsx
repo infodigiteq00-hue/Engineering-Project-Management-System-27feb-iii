@@ -33,35 +33,73 @@ export const useAuth = () => {
   return context;
 };
 
+/** Use auth when inside AuthProvider; returns undefined when outside (e.g. after provider unmount). Use for gates that must not throw. */
+export const useAuthOptional = (): AuthContextType | undefined => useContext(AuthContext);
+
 interface AuthProviderProps {
   children: React.ReactNode;
 }
 
 const FIRM_DATA_CACHE_KEY = 'epms_firm_data_cache';
 
-export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
-  const [user, setUser] = useState<User | null>(null);
-  const [userRole, setUserRole] = useState<string | null>(null);
-  const [userName, setUserName] = useState<string | null>(null);
-  const [firmId, setFirmId] = useState<string | null>(null);
-  const [firmData, setFirmData] = useState<FirmData | null>(() => {
-    try {
-      const raw = localStorage.getItem(FIRM_DATA_CACHE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as FirmData;
-        return parsed;
-      }
-    } catch {
-      // ignore
+/** Restore firm data from localStorage so logo/name are available immediately on refresh */
+function getInitialFirmData(): FirmData | null {
+  try {
+    const raw = localStorage.getItem(FIRM_DATA_CACHE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as FirmData;
+      return parsed;
     }
-    return null;
+    const userData = JSON.parse(localStorage.getItem('userData') || '{}');
+    const name = localStorage.getItem('companyName') || userData.company_name;
+    const logo = localStorage.getItem('companyLogo') || userData.logo_url;
+    if (name || logo) {
+      return { name: name || undefined, logo_url: logo ?? undefined };
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+/** Restore user/firm ids and role from localStorage for immediate use on refresh */
+function getInitialStoredAuth(): { firmId: string | null; userRole: string | null; userName: string | null } {
+  try {
+    const firmId = localStorage.getItem('firmId') || JSON.parse(localStorage.getItem('userData') || '{}').firm_id || null;
+    const userRole = localStorage.getItem('userRole') || JSON.parse(localStorage.getItem('userData') || '{}').role || null;
+    const userName = localStorage.getItem('userName') || JSON.parse(localStorage.getItem('userData') || '{}').full_name || null;
+    return { firmId, userRole, userName };
+  } catch {
+    return { firmId: null, userRole: null, userName: null };
+  }
+}
+
+export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
+  const initialStored = getInitialStoredAuth();
+  const [user, setUser] = useState<User | null>(null);
+  const [userRole, setUserRole] = useState<string | null>(initialStored.userRole);
+  const [userName, setUserName] = useState<string | null>(initialStored.userName);
+  const [firmId, setFirmId] = useState<string | null>(initialStored.firmId);
+  const [firmData, setFirmData] = useState<FirmData | null>(getInitialFirmData);
+  const [loading, setLoading] = useState(() => {
+    // If we have cached firm + role, consider auth "ready" immediately so UI and project fetch can run
+    return !(initialStored.firmId && initialStored.userRole);
   });
-  const [loading, setLoading] = useState(true);
   const firmRealtimeChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
 
   useEffect(() => {
-    // Get initial session with better error handling
     const initializeAuth = async () => {
+      // Restore from localStorage first so logo, name, firmId, and project fetch work on refresh
+      const stored = getInitialStoredAuth();
+      if (stored.firmId && stored.userRole) {
+        setFirmId(stored.firmId);
+        setUserRole(stored.userRole);
+        setUserName(stored.userName ?? localStorage.getItem('userName'));
+        const cachedFirm = getInitialFirmData();
+        if (cachedFirm) setFirmData(cachedFirm);
+        setLoading(false);
+      }
+
       try {
         const { data: { session }, error } = await supabase.auth.getSession();
         
@@ -151,15 +189,19 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       if (session?.user) {
         await fetchUserData(session.user.id);
       } else {
-        // Clear user data on sign out
-        setUserRole(null);
-        setUserName(null);
-        setFirmId(null);
-        setFirmData(null);
-        // Clear cache on logout
-        const { clearCache } = await import('@/utils/cache');
-        clearCache();
-        localStorage.clear();
+        // Only clear user data and localStorage on explicit sign out.
+        // Do NOT clear on INITIAL_SESSION or other events with null session — on refresh
+        // Supabase can fire with session null before session is rehydrated, which would
+        // wipe localStorage and prevent Index from loading projects (no firmId/userRole).
+        if (event === 'SIGNED_OUT') {
+          setUserRole(null);
+          setUserName(null);
+          setFirmId(null);
+          setFirmData(null);
+          const { clearCache } = await import('@/utils/cache');
+          clearCache();
+          localStorage.clear();
+        }
       }
       setLoading(false);
     });

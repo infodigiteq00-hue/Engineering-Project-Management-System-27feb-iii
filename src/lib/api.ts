@@ -626,9 +626,8 @@ export const fastAPI = {
       
       const progressImagesLatestOnly = options?.progressImagesLatestOnly === true;
       
-      // PERFORMANCE: Fetch progress images and entries in smaller batches to prevent timeouts
-      // CRITICAL: Reduced batch size from 50 to 15 and limits from 1000 to 250 for faster queries
-      const batchSize = 15; // Reduced from 50 to prevent timeouts
+      // PERFORMANCE: Fetch progress images and entries in batches (30 = fewer round-trips, still safe for timeouts)
+      const batchSize = 30;
       const allProgressImages: any[] = [];
       const allProgressEntries: any[] = [];
       
@@ -1156,20 +1155,66 @@ export const fastAPI = {
   },
 
   /**
+   * Batch fetch latest progress image URL per equipment. Returns Record<equipmentId, url | null>.
+   * One request instead of N for visible page thumbnails.
+   */
+  async getLatestProgressImageUrlsBatch(equipmentIds: string[], isStandalone: boolean = false): Promise<Record<string, string | null>> {
+    if (!equipmentIds?.length) return {};
+    if (import.meta.env.DEV) {
+      console.log(`[Batch] Latest progress image URLs: 1 request for ${equipmentIds.length} equipment (was ${equipmentIds.length} before batching)`);
+    }
+    try {
+      const table = isStandalone ? 'standalone_equipment_progress_images' : 'equipment_progress_images';
+      const limit = Math.max(500, equipmentIds.length * 2);
+      const res = await api.get(
+        `/${table}?equipment_id=in.(${equipmentIds.join(',')})&select=equipment_id,image_url,created_at&order=created_at.desc&limit=${limit}`,
+        { timeout: 15000 }
+      );
+      const rows: any[] = Array.isArray(res.data) ? res.data : [];
+      const result: Record<string, string | null> = {};
+      for (const id of equipmentIds) result[id] = null;
+      const seen = new Set<string>();
+      for (const row of rows) {
+        if (row.equipment_id && !seen.has(row.equipment_id)) {
+          seen.add(row.equipment_id);
+          result[row.equipment_id] = row.image_url ?? null;
+        }
+      }
+      return result;
+    } catch (error) {
+      console.warn('⚠️ getLatestProgressImageUrlsBatch failed (non-fatal):', error);
+      return Object.fromEntries(equipmentIds.map((id) => [id, null]));
+    }
+  },
+
+  /**
    * Fetch a single progress image URL by equipment and index (0 = latest).
    * Used when user clicks prev/next and USE_ON_DEMAND_PROGRESS_IMAGES is enabled.
    */
   async getProgressImageByEquipmentAndIndex(equipmentId: string, index: number, isStandalone: boolean = false): Promise<string | null> {
+    const row = await this.getProgressImageByEquipmentAndIndexFull(equipmentId, index, isStandalone);
+    return row?.image_url ?? null;
+  },
+
+  /**
+   * Fetch a single progress image row (URL + description + uploaded_by + upload_date) in ONE request.
+   * Use this to avoid multiple requests (URL, then description, then user, etc.) when loading next/prev image.
+   */
+  async getProgressImageByEquipmentAndIndexFull(
+    equipmentId: string,
+    index: number,
+    isStandalone: boolean = false
+  ): Promise<{ image_url: string; description?: string; uploaded_by?: string; upload_date?: string; created_at?: string } | null> {
     try {
       const table = isStandalone ? 'standalone_equipment_progress_images' : 'equipment_progress_images';
       const res = await api.get(
-        `/${table}?equipment_id=eq.${equipmentId}&select=image_url&order=created_at.desc&offset=${index}&limit=1`,
+        `/${table}?equipment_id=eq.${equipmentId}&select=image_url,description,uploaded_by,upload_date,created_at&order=created_at.desc&offset=${index}&limit=1`,
         { timeout: 10000 }
       );
       const data = Array.isArray(res.data) ? res.data : [];
-      return data[0]?.image_url ?? null;
+      return data[0] ?? null;
     } catch (error) {
-      console.warn('⚠️ getProgressImageByEquipmentAndIndex failed (non-fatal):', error);
+      console.warn('⚠️ getProgressImageByEquipmentAndIndexFull failed (non-fatal):', error);
       return null;
     }
   },
@@ -1315,6 +1360,60 @@ export const fastAPI = {
     }
   },
 
+  /** Batch fetch equipment activities for many equipment IDs. Returns Record<equipmentId, activities[]>. */
+  async getEquipmentActivitiesBatch(equipmentIds: string[]): Promise<Record<string, any[]>> {
+    if (!equipmentIds?.length) return {};
+    if (import.meta.env.DEV) {
+      console.log(`[Batch] Project activities: 1 batch for ${equipmentIds.length} equipment (was ${equipmentIds.length} before batching)`);
+    }
+    try {
+      const BATCH_CHUNK = 40;
+      const allActivities: any[] = [];
+      for (let i = 0; i < equipmentIds.length; i += BATCH_CHUNK) {
+        const chunk = equipmentIds.slice(i, i + BATCH_CHUNK);
+        const res = await api.get(
+          `/equipment_activities?equipment_id=in.(${chunk.join(',')})&select=*&order=sort_order.asc,sr_no.asc`,
+          { timeout: 15000 }
+        );
+        const rows = Array.isArray(res.data) ? res.data : [];
+        allActivities.push(...rows);
+      }
+      if (allActivities.length === 0) {
+        return Object.fromEntries(equipmentIds.map((id) => [id, []]));
+      }
+      const activityIds = [...new Set(allActivities.map((a: any) => a.id))];
+      const completionsSelect = 'id,activity_id,completed_on,completed_by_user_id,completed_by_display_name,notes,updated_on,updated_by,updated_by_user:updated_by(full_name)';
+      let completions: any[] = [];
+      for (let i = 0; i < activityIds.length; i += 100) {
+        const idChunk = activityIds.slice(i, i + 100);
+        const compRes = await api.get(
+          `/equipment_activity_completions?activity_id=in.(${idChunk.join(',')})&select=${completionsSelect}`,
+          { timeout: 10000 }
+        );
+        completions.push(...(Array.isArray(compRes.data) ? compRes.data : []));
+      }
+      const completionByActivityId = completions.reduce((acc: Record<string, any>, c) => {
+        acc[c.activity_id] = c;
+        return acc;
+      }, {});
+      const withCompletion = allActivities.map((a: any) => ({
+        ...a,
+        completion: completionByActivityId[a.id] || null
+      }));
+      const result: Record<string, any[]> = {};
+      for (const id of equipmentIds) result[id] = [];
+      for (const a of withCompletion) {
+        if (a.equipment_id) {
+          (result[a.equipment_id] = result[a.equipment_id] || []).push(a);
+        }
+      }
+      return result;
+    } catch (error: any) {
+      console.error('❌ Error fetching equipment activities batch:', error);
+      return Object.fromEntries(equipmentIds.map((id) => [id, []]));
+    }
+  },
+
   // Project equipment: create/upsert activities (from Excel upload); set commencement_date on equipment
   async setEquipmentActivities(equipmentId: string, payload: {
     commencement_date?: string | null;
@@ -1430,6 +1529,60 @@ export const fastAPI = {
     } catch (error) {
       console.error('❌ Error fetching standalone equipment activities:', error);
       throw error;
+    }
+  },
+
+  /** Batch fetch standalone equipment activities for many equipment IDs. Returns Record<equipmentId, activities[]>. */
+  async getStandaloneEquipmentActivitiesBatch(equipmentIds: string[]): Promise<Record<string, any[]>> {
+    if (!equipmentIds?.length) return {};
+    if (import.meta.env.DEV) {
+      console.log(`[Batch] Standalone activities: 1 batch for ${equipmentIds.length} equipment (was ${equipmentIds.length} before batching)`);
+    }
+    try {
+      const BATCH_CHUNK = 40;
+      const allActivities: any[] = [];
+      for (let i = 0; i < equipmentIds.length; i += BATCH_CHUNK) {
+        const chunk = equipmentIds.slice(i, i + BATCH_CHUNK);
+        const res = await api.get(
+          `/standalone_equipment_activities?equipment_id=in.(${chunk.join(',')})&select=*&order=sort_order.asc,sr_no.asc`,
+          { timeout: 15000 }
+        );
+        const rows = Array.isArray(res.data) ? res.data : [];
+        allActivities.push(...rows);
+      }
+      if (allActivities.length === 0) {
+        return Object.fromEntries(equipmentIds.map((id) => [id, []]));
+      }
+      const activityIds = [...new Set(allActivities.map((a: any) => a.id))];
+      const completionsSelect = 'id,activity_id,completed_on,completed_by_user_id,completed_by_display_name,notes,updated_on,updated_by,updated_by_user:updated_by(full_name)';
+      let completions: any[] = [];
+      for (let i = 0; i < activityIds.length; i += 100) {
+        const idChunk = activityIds.slice(i, i + 100);
+        const compRes = await api.get(
+          `/standalone_equipment_activity_completions?activity_id=in.(${idChunk.join(',')})&select=${completionsSelect}`,
+          { timeout: 10000 }
+        );
+        completions.push(...(Array.isArray(compRes.data) ? compRes.data : []));
+      }
+      const completionByActivityId = completions.reduce((acc: Record<string, any>, c) => {
+        acc[c.activity_id] = c;
+        return acc;
+      }, {});
+      const withCompletion = allActivities.map((a: any) => ({
+        ...a,
+        completion: completionByActivityId[a.id] || null
+      }));
+      const result: Record<string, any[]> = {};
+      for (const id of equipmentIds) result[id] = [];
+      for (const a of withCompletion) {
+        if (a.equipment_id) {
+          (result[a.equipment_id] = result[a.equipment_id] || []).push(a);
+        }
+      }
+      return result;
+    } catch (error: any) {
+      console.error('❌ Error fetching standalone equipment activities batch:', error);
+      return Object.fromEntries(equipmentIds.map((id) => [id, []]));
     }
   },
 
@@ -2039,6 +2192,38 @@ export const fastAPI = {
     }
   },
 
+  /** Batch fetch project equipment team positions for many equipment IDs. Returns Record<equipmentId, teamPositions[]>. */
+  async getProjectEquipmentTeamPositionsBatch(equipmentIds: string[]): Promise<Record<string, any[]>> {
+    if (!equipmentIds?.length) return {};
+    if (import.meta.env.DEV) {
+      const reqCount = Math.ceil(equipmentIds.length / 50) || 1;
+      console.log(`[Batch] Project team positions: ${reqCount} request(s) for ${equipmentIds.length} equipment (was ${equipmentIds.length} before batching)`);
+    }
+    try {
+      const BATCH_CHUNK = 50;
+      const allRows: any[] = [];
+      for (let i = 0; i < equipmentIds.length; i += BATCH_CHUNK) {
+        const chunk = equipmentIds.slice(i, i + BATCH_CHUNK);
+        const response = await api.get(
+          `/equipment_team_positions?equipment_id=in.(${chunk.join(',')})&order=created_at.desc`
+        );
+        const rows = Array.isArray(response.data) ? response.data : (response.data ? [response.data] : []);
+        allRows.push(...rows);
+      }
+      const result: Record<string, any[]> = {};
+      for (const id of equipmentIds) result[id] = [];
+      for (const row of allRows) {
+        if (row.equipment_id) {
+          (result[row.equipment_id] = result[row.equipment_id] || []).push(row);
+        }
+      }
+      return result;
+    } catch (error: any) {
+      console.error('Error fetching project equipment team positions batch:', error);
+      return Object.fromEntries(equipmentIds.map((id) => [id, []]));
+    }
+  },
+
   // Create team position (for project equipment)
   async createTeamPosition(teamPositionData: any) {
     try {
@@ -2067,6 +2252,38 @@ export const fastAPI = {
       return null;
     } catch {
       return null;
+    }
+  },
+
+  /** Batch fetch standalone equipment team positions for many equipment IDs. Returns Record<equipmentId, teamPositions[]>. */
+  async getStandaloneTeamPositionsBatch(equipmentIds: string[]): Promise<Record<string, any[]>> {
+    if (!equipmentIds?.length) return {};
+    if (import.meta.env.DEV) {
+      const reqCount = Math.ceil(equipmentIds.length / 50) || 1;
+      console.log(`[Batch] Standalone team positions: ${reqCount} request(s) for ${equipmentIds.length} equipment (was ${equipmentIds.length} before batching)`);
+    }
+    try {
+      const BATCH_CHUNK = 50;
+      const allRows: any[] = [];
+      for (let i = 0; i < equipmentIds.length; i += BATCH_CHUNK) {
+        const chunk = equipmentIds.slice(i, i + BATCH_CHUNK);
+        const response = await api.get(
+          `/standalone_equipment_team_positions?equipment_id=in.(${chunk.join(',')})&order=created_at.desc`
+        );
+        const rows = Array.isArray(response.data) ? response.data : (response.data ? [response.data] : []);
+        allRows.push(...rows);
+      }
+      const result: Record<string, any[]> = {};
+      for (const id of equipmentIds) result[id] = [];
+      for (const row of allRows) {
+        if (row.equipment_id) {
+          (result[row.equipment_id] = result[row.equipment_id] || []).push(row);
+        }
+      }
+      return result;
+    } catch (error: any) {
+      console.error('Error fetching standalone team positions batch:', error);
+      return Object.fromEntries(equipmentIds.map((id) => [id, []]));
     }
   },
 
@@ -2738,7 +2955,7 @@ export const fastAPI = {
         const equipmentIds = [...new Set(entries.map((entry: any) => entry.equipment_id).filter(Boolean))];
 
         const equipmentMap: Record<string, any> = {};
-        const batchSize = 15;
+        const batchSize = 50;
         for (let i = 0; i < equipmentIds.length; i += batchSize) {
           const batch = equipmentIds.slice(i, i + batchSize);
           try {
@@ -3075,7 +3292,7 @@ export const fastAPI = {
         const equipmentIds = [...new Set(images.map((img: any) => img.equipment_id).filter(Boolean))];
 
         const equipmentMap: Record<string, any> = {};
-        const batchSize = 15;
+        const batchSize = 50;
         for (let i = 0; i < equipmentIds.length; i += batchSize) {
           const batch = equipmentIds.slice(i, i + batchSize);
           try {
@@ -3939,6 +4156,45 @@ export const fastAPI = {
     }
   },
 
+  /** Batch fetch VDCR revision events for many record IDs in one or few requests. Returns map of vdcr_record_id -> events[] (each sorted by event_date desc). */
+  async getVDCRRevisionEventsBatch(vdcrRecordIds: string[]): Promise<Record<string, any[]>> {
+    if (!vdcrRecordIds?.length) return {};
+    const CHUNK = 40;
+    const out: Record<string, any[]> = {};
+    try {
+      for (let i = 0; i < vdcrRecordIds.length; i += CHUNK) {
+        const chunk = vdcrRecordIds.slice(i, i + CHUNK);
+        const idsFilter = chunk.join(',');
+        const response = await api.get(
+          `/vdcr_revision_events?vdcr_record_id=in.(${idsFilter})&select=*,created_by_user:created_by(full_name,email)&order=event_date.desc`,
+          { timeout: 20000 }
+        );
+        const list = Array.isArray(response.data) ? response.data : [];
+        for (const row of list) {
+          const rid = row.vdcr_record_id;
+          if (!out[rid]) out[rid] = [];
+          out[rid].push(row);
+        }
+      }
+      for (const id of vdcrRecordIds) {
+        if (out[id]) {
+          out[id].sort((a: any, b: any) => {
+            const tA = new Date(a.event_date).getTime();
+            const tB = new Date(b.event_date).getTime();
+            if (tB !== tA) return tB - tA;
+            return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+          });
+        }
+      }
+      return out;
+    } catch (error: any) {
+      if (error?.response?.status !== 404) {
+        console.error('❌ Error fetching VDCR revision events batch:', error);
+      }
+      return {};
+    }
+  },
+
   // Update VDCR revision event
   async updateVDCRRevisionEvent(eventId: string, updateData: any) {
     try {
@@ -4709,6 +4965,56 @@ export const getEquipmentDocumentsMetadata = async (equipmentId: string) => {
   }
 };
 
+const DOCS_METADATA_BATCH_CHUNK = 50;
+
+/** Batch fetch equipment documents metadata for many equipment IDs. Returns Record<equipmentId, doc[]>. Reduces N requests to 1 (or few if chunked). */
+export const getEquipmentDocumentsMetadataBatch = async (equipmentIds: string[]): Promise<Record<string, any[]>> => {
+  if (!equipmentIds?.length) return {};
+  if (import.meta.env.DEV) {
+    const reqCount = Math.ceil(equipmentIds.length / DOCS_METADATA_BATCH_CHUNK) + 1; // docs chunk(s) + 1 users
+    console.log(`[Batch] Documents metadata: ${reqCount} request(s) for ${equipmentIds.length} equipment (was ${equipmentIds.length}+ before batching)`);
+  }
+  try {
+    const allDocs: any[] = [];
+    for (let i = 0; i < equipmentIds.length; i += DOCS_METADATA_BATCH_CHUNK) {
+      const chunk = equipmentIds.slice(i, i + DOCS_METADATA_BATCH_CHUNK);
+      const response = await api.get('/equipment_documents', {
+        params: {
+          equipment_id: `in.(${chunk.join(',')})`,
+          select: 'id,equipment_id,document_name,document_type,upload_date,uploaded_by,created_at,vdcr_code_status,vdcr_document_status',
+          order: 'created_at.desc'
+        }
+      });
+      const rows = Array.isArray(response.data) ? response.data : [];
+      allDocs.push(...rows);
+    }
+    const userIds = [...new Set(allDocs.map((doc: any) => doc.uploaded_by).filter((id: any) => id && typeof id === 'string' && id.length === 36))];
+    let usersMap: Record<string, any> = {};
+    if (userIds.length > 0) {
+      try {
+        const usersResponse = await api.get('/users', { params: { id: `in.(${userIds.join(',')})`, select: 'id,full_name,email' } });
+        const users = Array.isArray(usersResponse.data) ? usersResponse.data : [];
+        usersMap = users.reduce((acc: any, u: any) => { acc[u.id] = { full_name: u.full_name, email: u.email }; return acc; }, {});
+      } catch (e) { console.warn('⚠️ Could not fetch user data for equipment documents metadata batch:', e); }
+    }
+    const withUsers = allDocs.map((doc: any) => ({
+      ...doc,
+      uploaded_by_user: doc.uploaded_by ? usersMap[doc.uploaded_by] : null
+    }));
+    const result: Record<string, any[]> = {};
+    for (const id of equipmentIds) result[id] = [];
+    for (const doc of withUsers) {
+      if (doc.equipment_id) {
+        (result[doc.equipment_id] = result[doc.equipment_id] || []).push(doc);
+      }
+    }
+    return result;
+  } catch (error: any) {
+    console.error('❌ Error fetching equipment documents metadata batch:', error);
+    return Object.fromEntries(equipmentIds.map((id) => [id, []]));
+  }
+};
+
 // Get single document URL by id (for on-demand preview - fetch only when user clicks View)
 export const getDocumentUrlById = async (documentId: string, isStandalone: boolean): Promise<{ document_url: string; document_name?: string; upload_date?: string; uploaded_by?: string; uploaded_by_user?: { full_name?: string } } | null> => {
   try {
@@ -4866,6 +5172,50 @@ export const getStandaloneEquipmentDocumentsMetadata = async (equipmentId: strin
   } catch (error: any) {
     console.error('❌ Error fetching standalone equipment documents metadata:', error);
     return [];
+  }
+};
+
+/** Batch fetch standalone equipment documents metadata for many equipment IDs. Returns Record<equipmentId, doc[]>. Reduces N requests to 1 (or few if chunked). */
+export const getStandaloneEquipmentDocumentsMetadataBatch = async (equipmentIds: string[]): Promise<Record<string, any[]>> => {
+  if (!equipmentIds?.length) return {};
+  try {
+    const allDocs: any[] = [];
+    for (let i = 0; i < equipmentIds.length; i += DOCS_METADATA_BATCH_CHUNK) {
+      const chunk = equipmentIds.slice(i, i + DOCS_METADATA_BATCH_CHUNK);
+      const response = await api.get('/standalone_equipment_documents', {
+        params: {
+          equipment_id: `in.(${chunk.join(',')})`,
+          select: 'id,equipment_id,document_name,document_type,upload_date,uploaded_by,created_at',
+          order: 'created_at.desc'
+        }
+      });
+      const rows = Array.isArray(response.data) ? response.data : [];
+      allDocs.push(...rows);
+    }
+    const userIds = [...new Set(allDocs.map((doc: any) => doc.uploaded_by).filter((id: any) => id && typeof id === 'string' && id.length === 36))];
+    let usersMap: Record<string, any> = {};
+    if (userIds.length > 0) {
+      try {
+        const usersResponse = await api.get('/users', { params: { id: `in.(${userIds.join(',')})`, select: 'id,full_name,email' } });
+        const users = Array.isArray(usersResponse.data) ? usersResponse.data : [];
+        usersMap = users.reduce((acc: any, u: any) => { acc[u.id] = { full_name: u.full_name, email: u.email }; return acc; }, {});
+      } catch (e) { console.warn('⚠️ Could not fetch user data for standalone documents metadata batch:', e); }
+    }
+    const withUsers = allDocs.map((doc: any) => ({
+      ...doc,
+      uploaded_by_user: doc.uploaded_by ? usersMap[doc.uploaded_by] : null
+    }));
+    const result: Record<string, any[]> = {};
+    for (const id of equipmentIds) result[id] = [];
+    for (const doc of withUsers) {
+      if (doc.equipment_id) {
+        (result[doc.equipment_id] = result[doc.equipment_id] || []).push(doc);
+      }
+    }
+    return result;
+  } catch (error: any) {
+    console.error('❌ Error fetching standalone equipment documents metadata batch:', error);
+    return Object.fromEntries(equipmentIds.map((id) => [id, []]));
   }
 };
 

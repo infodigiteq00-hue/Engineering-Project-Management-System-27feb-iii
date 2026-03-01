@@ -3,7 +3,7 @@ import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
-import { AuthProvider, useAuth } from "@/contexts/AuthContext";
+import { AuthProvider, useAuthOptional } from "@/contexts/AuthContext";
 import { NotificationReadsProvider } from "@/contexts/NotificationReadsContext";
 import RoleBasedRoute from "@/components/RoleBasedRoute";
 import Login from "./pages/Login";
@@ -17,9 +17,9 @@ import NoPermission from "./components/NoPermission";
 const queryClient = new QueryClient();
 
 function NotificationReadsGate({ children }: { children: React.ReactNode }) {
-  const { user } = useAuth();
+  const auth = useAuthOptional();
   return (
-    <NotificationReadsProvider userId={user?.id ?? null}>
+    <NotificationReadsProvider userId={auth?.user?.id ?? null}>
       {children}
     </NotificationReadsProvider>
   );

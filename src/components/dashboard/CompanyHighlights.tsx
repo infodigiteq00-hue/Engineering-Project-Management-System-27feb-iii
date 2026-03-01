@@ -6,12 +6,16 @@ import { UnreadEntityDot } from '@/contexts/NotificationReadsContext';
 import axios from 'axios';
 import { Clock, User, FileText, CheckCircle, Send, Play, Pause, X, Eye, Search } from 'lucide-react';
 import { Input } from '@/components/ui/input';
-import { prefetchWithCache, CACHE_KEYS, hasCache, setCache, getCache } from '@/utils/cache';
+import { prefetchWithCache, CACHE_KEYS, hasCache, setCache, getCache, getCacheAge } from '@/utils/cache';
 // Company highlights caching - metadata-only caching enabled
 
 interface CompanyHighlightsProps {
   onSelectProject?: (projectId: string, initialTab?: string, options?: { fromUpdateCard?: boolean }) => void;
   onMarkAsRead?: (entityKey: string) => void;
+  /** When provided, skip project IDs fetch (reduces landing-page requests). */
+  initialProjectIds?: string[];
+  /** When true with initialProjectIds, use as firm-wide list; else as assigned list. */
+  isFirmAdmin?: boolean;
 }
 
 type TimePeriod = '1 Day' | '1 Week' | '1 Month' | 'Custom';
@@ -19,11 +23,13 @@ type ActiveTab = 'production' | 'documentation' | 'timeline' | 'milestone';
 type ProductionSubTab = 'key-progress' | 'all-updates';
 type TimelineSubTab = 'with-dates' | 'without-dates';
 
-const CompanyHighlights = ({ onSelectProject, onMarkAsRead }: CompanyHighlightsProps) => {
+const CompanyHighlights = ({ onSelectProject, onMarkAsRead, initialProjectIds, isFirmAdmin: propsIsFirmAdmin }: CompanyHighlightsProps) => {
   const { firmId: authFirmId, userRole: authUserRole, loading: authLoading } = useAuth();
   const [timePeriod, setTimePeriod] = useState<TimePeriod>('1 Week');
   const [activeTab, setActiveTab] = useState<ActiveTab>('production');
   const [productionSubTab, setProductionSubTab] = useState<ProductionSubTab>('key-progress');
+  /** Defer data fetches by 2s on mount to reduce landing-page request burst. */
+  const [deferReady, setDeferReady] = useState(false);
   const [timelineSubTab, setTimelineSubTab] = useState<TimelineSubTab>('with-dates');
   const [productionUpdates, setProductionUpdates] = useState<any[]>([]);
   const [equipmentCardUpdates, setEquipmentCardUpdates] = useState<any[]>([]);
@@ -172,9 +178,26 @@ const CompanyHighlights = ({ onSelectProject, onMarkAsRead }: CompanyHighlightsP
     }
   };
 
-  // Load user role and fetch assigned projects on mount
+  // Defer data fetches by 2s to reduce landing-page request burst
+  useEffect(() => {
+    const t = setTimeout(() => setDeferReady(true), 2000);
+    return () => clearTimeout(t);
+  }, []);
+
+  // Load user role and fetch assigned projects on mount (or use initialProjectIds from parent to avoid duplicate fetch)
   // Wait for AuthContext to finish loading, but use localStorage if available
   useEffect(() => {
+    // When parent provides project IDs (e.g. Index after getProjectsByFirm), use them and skip fetch
+    if (initialProjectIds !== undefined) {
+      if (propsIsFirmAdmin) {
+        setFirmProjectIds([...initialProjectIds]);
+      } else {
+        setAssignedProjectIds([...initialProjectIds]);
+      }
+      setProjectIdsLoaded(true);
+      return;
+    }
+
     // Check if we have data in localStorage
     const localStorageFirmId = JSON.parse(localStorage.getItem('userData') || '{}').firm_id || localStorage.getItem('firmId');
     const localStorageUserRole = localStorage.getItem('userRole');
@@ -182,10 +205,8 @@ const CompanyHighlights = ({ onSelectProject, onMarkAsRead }: CompanyHighlightsP
     // If AuthContext is still loading but localStorage has data, proceed anyway
     if (authLoading) {
       if (localStorageFirmId && localStorageUserRole) {
-        // // console.log('⚠️ CompanyHighlights: AuthContext still loading but localStorage has data, proceeding...', { localStorageFirmId, localStorageUserRole });
         // Continue - don't return
       } else {
-        // // console.log('⏳ CompanyHighlights: Waiting for auth to load...');
         return;
       }
     }
@@ -198,39 +219,29 @@ const CompanyHighlights = ({ onSelectProject, onMarkAsRead }: CompanyHighlightsP
       console.error('❌ CompanyHighlights: No firmId found. AuthContext:', { firmId, userRole, authLoading }, 'localStorage:', localStorage.getItem('userData'));
       return;
     }
-    
-    // // console.log('✅ CompanyHighlights: Starting data fetch', { currentFirmId, currentUserRole });
 
     const loadUserData = async () => {
       const userId = localStorage.getItem('userId') || '';
       
-      // Use values from AuthContext (already available via destructuring)
-      // userRole and firmId are now from AuthContext
-      
-      // If VDCR Manager, set active tab to documentation
       if (currentUserRole === 'vdcr_manager') {
         setActiveTab('documentation');
       }
       
-      // Fetch project IDs based on role
       if (currentUserRole === 'firm_admin') {
         if (currentFirmId) {
-          // Preload all project IDs for this firm to enforce firm-level isolation
           await fetchFirmProjects(currentFirmId);
         }
         setProjectIdsLoaded(true);
       } else if (userId) {
-        // Fetch assigned project IDs for non-firm-admin users
         await fetchAssignedProjects(userId);
         setProjectIdsLoaded(true);
       } else {
-        // No userId, mark as loaded anyway (will show empty state)
         setProjectIdsLoaded(true);
       }
     };
     
     loadUserData();
-  }, [authLoading, firmId, userRole]); // Re-run when auth values change
+  }, [authLoading, firmId, userRole, initialProjectIds, propsIsFirmAdmin]); // Re-run when auth values change
   
   // Check if user can see a tab
   const canSeeTab = (tab: ActiveTab) => {
@@ -300,17 +311,12 @@ const CompanyHighlights = ({ onSelectProject, onMarkAsRead }: CompanyHighlightsP
                 const pid = eq.project_id || eq.projects?.id;
                 return pid && !completedProjectIds.includes(pid);
               });
-              const withActivities = await Promise.all(
-                nonCompleted.map(async (eq: any) => {
-                  if (!eq.project_id) return { eq, activities: [] };
-                  try {
-                    const activities = await fastAPI.getEquipmentActivities(eq.id);
-                    return { eq, activities: Array.isArray(activities) ? activities : [] };
-                  } catch {
-                    return { eq, activities: [] };
-                  }
-                })
-              );
+              const equipmentIds = nonCompleted.map((eq: any) => eq.id).filter(Boolean);
+              const batchMap = equipmentIds.length > 0 ? await fastAPI.getEquipmentActivitiesBatch(equipmentIds) : {};
+              const withActivities = nonCompleted.map((eq: any) => ({
+                eq,
+                activities: Array.isArray(batchMap[eq.id]) ? batchMap[eq.id] : []
+              }));
               const merged = withActivities.map(({ eq, activities }: { eq: any; activities: any[] }) => {
                 const firstIncomplete = activities.find((a: any) => !a.completion);
                 if (firstIncomplete) {
@@ -338,7 +344,7 @@ const CompanyHighlights = ({ onSelectProject, onMarkAsRead }: CompanyHighlightsP
           return;
         }
 
-        // Fetch fresh data: equipment + next milestones from uploaded activities template
+        // Fetch fresh data: equipment + next milestones (batched: one API call for all equipment activities)
         setLoading(true);
         try {
           const equipment = await fastAPI.getAllEquipmentNearingCompletion(undefined, undefined, projectIds);
@@ -347,17 +353,12 @@ const CompanyHighlights = ({ onSelectProject, onMarkAsRead }: CompanyHighlightsP
             const pid = eq.project_id || eq.projects?.id;
             return pid && !completedProjectIds.includes(pid);
           });
-          const withActivities = await Promise.all(
-            nonCompleted.map(async (eq: any) => {
-              if (!eq.project_id) return { eq, activities: [] };
-              try {
-                const activities = await fastAPI.getEquipmentActivities(eq.id);
-                return { eq, activities: Array.isArray(activities) ? activities : [] };
-              } catch {
-                return { eq, activities: [] };
-              }
-            })
-          );
+          const equipmentIds = nonCompleted.map((eq: any) => eq.id).filter(Boolean);
+          const batchMap = equipmentIds.length > 0 ? await fastAPI.getEquipmentActivitiesBatch(equipmentIds) : {};
+          const withActivities = nonCompleted.map((eq: any) => ({
+            eq,
+            activities: Array.isArray(batchMap[eq.id]) ? batchMap[eq.id] : []
+          }));
           const merged = withActivities.map(({ eq, activities }: { eq: any; activities: any[] }) => {
             const firstIncomplete = activities.find((a: any) => !a.completion);
             if (firstIncomplete) {
@@ -477,10 +478,9 @@ const CompanyHighlights = ({ onSelectProject, onMarkAsRead }: CompanyHighlightsP
   }, []); // Only recalculate when component mounts, not on every render
 
   // Fetch production updates (progress images for Key Progress, progress entries for All Updates)
-  // FIX: Added request cancellation and fixed state clearing
+  // FIX: Added request cancellation and fixed state clearing. Deferred by 2s (deferReady) to reduce landing burst.
   useEffect(() => {
-    // Wait for project IDs to be loaded before fetching
-    if (!projectIdsLoaded) {
+    if (!projectIdsLoaded || !deferReady) {
       return;
     }
 
@@ -531,18 +531,22 @@ const CompanyHighlights = ({ onSelectProject, onMarkAsRead }: CompanyHighlightsP
           if (cachedData && isMounted && !abortController.signal.aborted) {
             setProductionUpdates(cachedData);
             setLoading(false);
-            // Fetch fresh data in background
-            fastAPI.getAllProgressImagesMetadata(dateRangeStart, dateRangeEnd, projectIds)
-              .then(images => {
-                if (isMounted && !abortController.signal.aborted) {
-                  const filteredImages = filterByAssignedProjects(images, 'equipment.project_id');
-                  setProductionUpdates(Array.isArray(filteredImages) ? filteredImages : []);
-                  setCache(cacheKey, Array.isArray(filteredImages) ? filteredImages : [], { ttl: 5 * 60 * 1000 });
-                }
-              })
-              .catch(error => {
-                console.warn('Background refresh failed for production images:', error);
-              });
+            // Preserve: skip background refresh if cache is fresh (< 2 min) to avoid refetch when switching back to Projects tab
+            const cacheAge = getCacheAge(cacheKey, {});
+            const PRESERVE_MS = 2 * 60 * 1000;
+            if (cacheAge === null || cacheAge >= PRESERVE_MS) {
+              fastAPI.getAllProgressImagesMetadata(dateRangeStart, dateRangeEnd, projectIds)
+                .then(images => {
+                  if (isMounted && !abortController.signal.aborted) {
+                    const filteredImages = filterByAssignedProjects(images, 'equipment.project_id');
+                    setProductionUpdates(Array.isArray(filteredImages) ? filteredImages : []);
+                    setCache(cacheKey, Array.isArray(filteredImages) ? filteredImages : [], { ttl: 5 * 60 * 1000 });
+                  }
+                })
+                .catch(error => {
+                  console.warn('Background refresh failed for production images:', error);
+                });
+            }
             return;
           }
 
@@ -605,18 +609,22 @@ const CompanyHighlights = ({ onSelectProject, onMarkAsRead }: CompanyHighlightsP
           if (cachedData && isMounted && !abortController.signal.aborted) {
             setProductionUpdates(cachedData);
             setLoading(false);
-            // Fetch fresh data in background
-            fastAPI.getAllProgressEntriesMetadata(dateRangeStart, dateRangeEnd, projectIds)
-              .then(entries => {
-                if (isMounted && !abortController.signal.aborted) {
-                  const filteredEntries = filterByAssignedProjects(entries, 'equipment.project_id');
-                  setProductionUpdates(Array.isArray(filteredEntries) ? filteredEntries : []);
-                  setCache(cacheKey, Array.isArray(filteredEntries) ? filteredEntries : [], { ttl: 5 * 60 * 1000 });
-                }
-              })
-              .catch(error => {
-                console.warn('Background refresh failed for production entries:', error);
-              });
+            // Preserve: skip background refresh if cache is fresh (< 2 min) to avoid refetch when switching back to Projects tab
+            const cacheAge = getCacheAge(cacheKey, {});
+            const PRESERVE_MS = 2 * 60 * 1000;
+            if (cacheAge === null || cacheAge >= PRESERVE_MS) {
+              fastAPI.getAllProgressEntriesMetadata(dateRangeStart, dateRangeEnd, projectIds)
+                .then(entries => {
+                  if (isMounted && !abortController.signal.aborted) {
+                    const filteredEntries = filterByAssignedProjects(entries, 'equipment.project_id');
+                    setProductionUpdates(Array.isArray(filteredEntries) ? filteredEntries : []);
+                    setCache(cacheKey, Array.isArray(filteredEntries) ? filteredEntries : [], { ttl: 5 * 60 * 1000 });
+                  }
+                })
+                .catch(error => {
+                  console.warn('Background refresh failed for production entries:', error);
+                });
+            }
             return;
           }
 
@@ -664,7 +672,7 @@ const CompanyHighlights = ({ onSelectProject, onMarkAsRead }: CompanyHighlightsP
       isMounted = false;
       abortController.abort();
     };
-  }, [dateRangeStart, dateRangeEnd, isExpanded, activeTab, productionSubTab, userRole, assignedProjectIds, firmProjectIds, timePeriod, projectIdsLoaded, completedProjectIds]);
+  }, [dateRangeStart, dateRangeEnd, isExpanded, activeTab, productionSubTab, userRole, assignedProjectIds, firmProjectIds, timePeriod, projectIdsLoaded, completedProjectIds, deferReady]);
 
   // Fetch equipment card updates (equipment_updated activity logs)
   // NOTE: This runs separately for "All Updates" tab but doesn't affect the main loading state
@@ -729,25 +737,19 @@ const CompanyHighlights = ({ onSelectProject, onMarkAsRead }: CompanyHighlightsP
           return;
         }
 
-        // Fetch equipment activity logs with activity_type = 'equipment_updated'
+        // Fetch equipment activity logs (batched: one API call for all project IDs)
         const allUpdates: any[] = [];
         
         if (projectIds && projectIds.length > 0) {
-          // Fetch for each assigned project
-          for (const projectId of projectIds) {
-            try {
-              const logs = await activityApi.getEquipmentActivityLogs(projectId, {
-                activityType: 'equipment_updated',
-                dateFrom: dateRangeStart,
-                dateTo: dateRangeEnd
-              });
-              if (Array.isArray(logs)) {
-                // // console.log(`🔧 CompanyHighlights: Got ${logs.length} equipment logs for project ${projectId}`);
-                allUpdates.push(...logs);
-              }
-            } catch (error) {
-              console.error(`❌ CompanyHighlights: Error fetching equipment logs for project ${projectId}:`, error);
-            }
+          try {
+            const logs = await activityApi.getEquipmentActivityLogsBatch(projectIds, {
+              activityType: 'equipment_updated',
+              dateFrom: dateRangeStart,
+              dateTo: dateRangeEnd
+            });
+            if (Array.isArray(logs)) allUpdates.push(...logs);
+          } catch (error) {
+            console.error('❌ CompanyHighlights: Error fetching equipment logs batch:', error);
           }
         } else if (userRole === 'firm_admin') {
           // For firm admin, fetch all equipment updates across all projects
@@ -1435,25 +1437,21 @@ const CompanyHighlights = ({ onSelectProject, onMarkAsRead }: CompanyHighlightsP
             setProductionUpdates(Array.isArray(filteredEntries) ? filteredEntries : []);
           }
           
-          // Refresh equipment card updates if on all-updates tab
+          // Refresh equipment card updates if on all-updates tab (batched: one API call for all project IDs)
           if (productionSubTab === 'all-updates') {
             const projectIds = userRole === 'firm_admin' ? firmProjectIds : assignedProjectIds;
             const allUpdates: any[] = [];
             
             if (projectIds && projectIds.length > 0) {
-              for (const projectId of projectIds) {
-                try {
-                  const logs = await activityApi.getEquipmentActivityLogs(projectId, {
-                    activityType: 'equipment_updated',
-                    dateFrom: dateRangeStart,
-                    dateTo: dateRangeEnd
-                  });
-                  if (Array.isArray(logs)) {
-                    allUpdates.push(...logs);
-                  }
-                } catch (error) {
-                  console.error(`Error fetching updates for project ${projectId}:`, error);
-                }
+              try {
+                const logs = await activityApi.getEquipmentActivityLogsBatch(projectIds, {
+                  activityType: 'equipment_updated',
+                  dateFrom: dateRangeStart,
+                  dateTo: dateRangeEnd
+                });
+                if (Array.isArray(logs)) allUpdates.push(...logs);
+              } catch (error) {
+                console.error('Error fetching equipment logs batch:', error);
               }
             } else if (userRole === 'firm_admin') {
               try {
@@ -1581,17 +1579,12 @@ const CompanyHighlights = ({ onSelectProject, onMarkAsRead }: CompanyHighlightsP
             const pid = eq.project_id || eq.projects?.id;
             return pid && !completedProjectIds.includes(pid);
           });
-          const withActivities = await Promise.all(
-            nonCompleted.map(async (eq: any) => {
-              if (!eq.project_id) return { eq, activities: [] };
-              try {
-                const activities = await fastAPI.getEquipmentActivities(eq.id);
-                return { eq, activities: Array.isArray(activities) ? activities : [] };
-              } catch {
-                return { eq, activities: [] };
-              }
-            })
-          );
+          const equipmentIds = nonCompleted.map((eq: any) => eq.id).filter(Boolean);
+          const batchMap = equipmentIds.length > 0 ? await fastAPI.getEquipmentActivitiesBatch(equipmentIds) : {};
+          const withActivities = nonCompleted.map((eq: any) => ({
+            eq,
+            activities: Array.isArray(batchMap[eq.id]) ? batchMap[eq.id] : []
+          }));
           const merged = withActivities.map(({ eq, activities }: { eq: any; activities: any[] }) => {
             const firstIncomplete = activities.find((a: any) => !a.completion);
             if (firstIncomplete) {

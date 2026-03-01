@@ -13,7 +13,7 @@ import { Eye, Calendar, User, MapPin, ChevronLeft, ChevronRight, ChevronUp, Chev
 import AddEquipmentForm from "@/components/forms/AddEquipmentForm";
 import AddStandaloneEquipmentFormNew from "@/components/forms/AddStandaloneEquipmentFormNew";
 import AddTechnicalSectionModal from "@/components/forms/AddTechnicalSectionModal";
-import { fastAPI, getEquipmentDocuments, getEquipmentDocumentsMetadata, getStandaloneEquipmentDocumentsMetadata, getDocumentUrlById, deleteEquipmentDocument, uploadEquipmentDocument, uploadStandaloneEquipmentDocument, getStandaloneEquipmentDocuments, deleteStandaloneEquipmentDocument } from "@/lib/api";
+import { fastAPI, getEquipmentDocuments, getEquipmentDocumentsMetadata, getStandaloneEquipmentDocumentsMetadata, getEquipmentDocumentsMetadataBatch, getStandaloneEquipmentDocumentsMetadataBatch, getDocumentUrlById, deleteEquipmentDocument, uploadEquipmentDocument, uploadStandaloneEquipmentDocument, getStandaloneEquipmentDocuments, deleteStandaloneEquipmentDocument } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
 import { updateEquipment } from "@/lib/database";
 import { useToast } from "@/hooks/use-toast";
@@ -248,8 +248,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         teamData = await DatabaseService.getStandaloneTeamPositions(viewingEquipmentId);
       } else {
         // Project equipment: equipment_team_positions table (who works on this equipment at what position)
-        const { default: fastAPI } = await import('@/lib/api');
-        teamData = await fastAPI.getProjectEquipmentTeamPositions(viewingEquipmentId);
+        const { fastAPI: apiFast } = await import('@/lib/api');
+        teamData = await apiFast.getProjectEquipmentTeamPositions(viewingEquipmentId);
       }
       devLog('📥 Raw team data received:', teamData);
       
@@ -298,14 +298,15 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     }
   }, [viewingEquipmentId, projectId]);
 
-  // Pre-fetch team members for all project equipment when equipment list loads (for equipment card grid)
+  // Pre-fetch team members for all project equipment when equipment list loads (batched: one API call for all IDs)
   const fetchAllProjectEquipmentTeamMembers = useCallback(async (equipmentList: any[]) => {
     if (projectId === 'standalone' || !equipmentList?.length) return;
     try {
-      const { default: fastAPI } = await import('@/lib/api');
+      const equipmentIds = equipmentList.map((eq: any) => eq.id);
+      const batchMap = await fastAPI.getProjectEquipmentTeamPositionsBatch(equipmentIds);
       const updates: Record<string, any[]> = {};
       for (const eq of equipmentList) {
-        const teamData = await fastAPI.getProjectEquipmentTeamPositions(eq.id);
+        const teamData = batchMap[eq.id] ?? [];
         const transformed = (teamData as any[]).map((m: any, i: number) => ({
           id: m.id || `member-${i}`,
           name: m.person_name || 'Unknown',
@@ -736,18 +737,17 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       });
   }, []);
 
-  // Fill latest progress image (index 0) for the given equipment only; used for *visible* page so all 8 cards get image
+  // Fill latest progress image (index 0) for the given equipment (batched: one API call for all visible cards)
   const fillLatestProgressImagesForPage = useCallback(async (
     list: Equipment[],
     equipmentToFill: Equipment[],
     isStandalone: boolean
   ): Promise<Equipment[]> => {
     if (!USE_ON_DEMAND_PROGRESS_IMAGES || list.length === 0 || equipmentToFill.length === 0) return list;
-    const urls = await Promise.all(equipmentToFill.map(eq => fastAPI.getLatestProgressImageUrl(eq.id, isStandalone)));
-    const idToUrl = new Map<string, string>();
-    equipmentToFill.forEach((eq, i) => { if (urls[i]) idToUrl.set(eq.id, urls[i]); });
+    const ids = equipmentToFill.map((eq) => eq.id);
+    const urlMap = await fastAPI.getLatestProgressImageUrlsBatch(ids, isStandalone);
     return list.map(eq => {
-      const url = idToUrl.get(eq.id);
+      const url = urlMap[eq.id];
       if (!url) return eq;
       const next = [...(eq.progressImages || [])];
       if (next.length > 0) next[0] = url;
@@ -799,10 +799,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     setAllCertificationTitles(Array.from(titles).sort());
   }, [localEquipment]);
 
-  // Load activities for all grid equipment when grid is populated (so progress bar persists after refresh)
+  // Load activities for all grid equipment (batched: one API call for all missing IDs instead of N)
   useEffect(() => {
     if (!localEquipment?.length || !projectId) return;
-    const isStandalone = projectId === 'standalone';
     const missingIds = localEquipment
       .map((eq: Equipment) => eq.id)
       .filter((id: string) => equipmentActivities[id] === undefined);
@@ -810,20 +809,21 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
 
     const fetchAll = async () => {
       missingIds.forEach((id: string) => setLoadingActivities(prev => ({ ...prev, [id]: true })));
-      const apiCall = (id: string) =>
-        isStandalone ? fastAPI.getStandaloneEquipmentActivities(id) : fastAPI.getEquipmentActivities(id);
-      const results = await Promise.allSettled(missingIds.map((id: string) => apiCall(id)));
-      const updates: Record<string, any[]> = {};
-      results.forEach((result, i) => {
-        const id = missingIds[i];
-        if (result.status === 'fulfilled' && Array.isArray(result.value)) {
-          updates[id] = result.value;
+      try {
+        const batchMap = projectId === 'standalone'
+          ? await fastAPI.getStandaloneEquipmentActivitiesBatch(missingIds)
+          : await fastAPI.getEquipmentActivitiesBatch(missingIds);
+        const updates: Record<string, any[]> = {};
+        for (const id of missingIds) {
+          const list = batchMap[id];
+          if (Array.isArray(list)) updates[id] = list;
         }
-      });
-      if (Object.keys(updates).length > 0) {
-        setEquipmentActivities(prev => ({ ...prev, ...updates }));
+        if (Object.keys(updates).length > 0) {
+          setEquipmentActivities(prev => ({ ...prev, ...updates }));
+        }
+      } finally {
+        missingIds.forEach((id: string) => setLoadingActivities(prev => ({ ...prev, [id]: false })));
       }
-      missingIds.forEach((id: string) => setLoadingActivities(prev => ({ ...prev, [id]: false })));
     };
     fetchAll();
   }, [localEquipment, projectId, equipmentActivities]);
@@ -941,11 +941,10 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     }
   }, [editingEquipmentId, localEquipment]);
 
-  // Load documents for all equipment
+  // Load documents for all equipment (batched: one API call for all IDs instead of N)
   const loadDocumentsForEquipment = async (equipmentList: Equipment[]) => {
     try {
-
-      // First, import existing documents from storage
+      // Batch fetch: single request for all equipment IDs
       // DISABLED: This function uses hardcoded invalid values and causes errors
       // Documents are already imported and loaded from database correctly
       // try {
@@ -954,31 +953,32 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       //   devError('❌ Error importing existing documents:', error);
       // }
 
-      const documentsMap: Record<string, any[]> = {};
-
-      for (const eq of equipmentList) {
-        try {
-          const docs = projectId === 'standalone'
-            ? await getStandaloneEquipmentDocumentsMetadata(eq.id)
-            : await getEquipmentDocumentsMetadata(eq.id);
-          const transformedDocs = Array.isArray(docs) ? docs.map((doc: any) => ({
-            id: doc.id,
-            name: doc.document_name || doc.name,
-            document_name: doc.document_name || doc.name,
-            document_url: undefined as string | undefined,
-            uploadedBy: doc.uploaded_by_user?.full_name || doc.uploaded_by || 'Unknown',
-            uploadDate: doc.upload_date || doc.created_at,
-            document_type: doc.document_type || 'Equipment Document',
-            vdcr_code_status: doc.vdcr_code_status,
-            vdcr_document_status: doc.vdcr_document_status
-          })) : [];
-          documentsMap[eq.id] = transformedDocs;
-        } catch (error) {
-          devError(`❌ Error loading documents for equipment ${eq.id}:`, error);
-          documentsMap[eq.id] = [];
-        }
+      if (!equipmentList.length) {
+        setDocuments({});
+        return;
       }
+      const equipmentIds = equipmentList.map((eq) => eq.id);
+      const batchMap = projectId === 'standalone'
+        ? await getStandaloneEquipmentDocumentsMetadataBatch(equipmentIds)
+        : await getEquipmentDocumentsMetadataBatch(equipmentIds);
 
+      const transformDoc = (doc: any) => ({
+        id: doc.id,
+        name: doc.document_name || doc.name,
+        document_name: doc.document_name || doc.name,
+        document_url: undefined as string | undefined,
+        uploadedBy: doc.uploaded_by_user?.full_name || doc.uploaded_by || 'Unknown',
+        uploadDate: doc.upload_date || doc.created_at,
+        document_type: doc.document_type || 'Equipment Document',
+        vdcr_code_status: doc.vdcr_code_status,
+        vdcr_document_status: doc.vdcr_document_status
+      });
+
+      const documentsMap: Record<string, any[]> = {};
+      for (const eq of equipmentList) {
+        const docs = batchMap[eq.id] ?? [];
+        documentsMap[eq.id] = Array.isArray(docs) ? docs.map(transformDoc) : [];
+      }
       setDocuments(documentsMap);
     } catch (error) {
       devError('❌ Error loading documents:', error);
@@ -1023,50 +1023,44 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       // console.log('🔄 EquipmentGrid: Equipment IDs:', transformedEquipment.map(eq => eq.id));
       setLocalEquipment(transformedEquipment);
 
-      // OPTIMIZATION: Pre-fetch team members for all standalone equipment in background
-      // This ensures team members are available immediately when viewing equipment cards
+      // OPTIMIZATION: Pre-fetch team members for all standalone equipment in background (batched: one API call for all IDs)
       if (projectId === 'standalone' && transformedEquipment && transformedEquipment.length > 0) {
         devLog('🔄 Pre-fetching team members for all equipment in background...');
-        // Use Promise.allSettled to fetch all in parallel without blocking
-        Promise.allSettled(
-          transformedEquipment.map(async (eq: Equipment) => {
-            // Only fetch if not already cached
-            if (!allEquipmentTeamMembers[eq.id] || allEquipmentTeamMembers[eq.id].length === 0) {
-              try {
-                const { DatabaseService } = await import('@/lib/database');
-                const teamData = await DatabaseService.getStandaloneTeamPositions(eq.id);
-                
-                if (teamData && teamData.length > 0) {
-                  const transformedMembers = (teamData as any[]).map((member, index) => ({
-                    id: member.id || `member-${index}`,
-                    name: member.person_name || 'Unknown',
-                    email: member.email || '',
-                    phone: member.phone || '',
-                    position: member.position_name || '',
-                    role: member.role || 'viewer',
-                    permissions: getPermissionsByRole(member.role || 'viewer'),
-                    status: 'active',
-                    avatar: (member.person_name || 'U').split(' ').map((n: string) => n[0]).join('').toUpperCase(),
-                    lastActive: 'Unknown',
-                    equipmentAssignments: [eq.id],
-                    dataAccess: getDataAccessByRole(member.role || 'viewer'),
-                    accessLevel: member.role || 'viewer'
-                  }));
-                  
-                  setAllEquipmentTeamMembers(prev => ({
-                    ...prev,
-                    [eq.id]: transformedMembers
-                  }));
-                  devLog('✅ Pre-fetched team members for equipment:', eq.id, 'count:', transformedMembers.length);
-                }
-              } catch (error) {
-                devError('❌ Error pre-fetching team members for equipment', eq.id, '(non-fatal):', error);
+        const idsToFetch = transformedEquipment
+          .filter((eq: Equipment) => !allEquipmentTeamMembers[eq.id] || allEquipmentTeamMembers[eq.id].length === 0)
+          .map((eq: Equipment) => eq.id);
+        if (idsToFetch.length > 0) {
+          fastAPI.getStandaloneTeamPositionsBatch(idsToFetch).then((batchMap) => {
+            const updates: Record<string, any[]> = {};
+            for (const eq of transformedEquipment) {
+              const teamData = batchMap[eq.id] ?? [];
+              if (teamData.length > 0) {
+                const transformedMembers = (teamData as any[]).map((member: any, index: number) => ({
+                  id: member.id || `member-${index}`,
+                  name: member.person_name || 'Unknown',
+                  email: member.email || '',
+                  phone: member.phone || '',
+                  position: member.position_name || '',
+                  role: member.role || 'viewer',
+                  permissions: getPermissionsByRole(member.role || 'viewer'),
+                  status: 'active',
+                  avatar: (member.person_name || 'U').split(' ').map((n: string) => n[0]).join('').toUpperCase(),
+                  lastActive: 'Unknown',
+                  equipmentAssignments: [eq.id],
+                  dataAccess: getDataAccessByRole(member.role || 'viewer'),
+                  accessLevel: member.role || 'viewer'
+                }));
+                updates[eq.id] = transformedMembers;
               }
             }
-          })
-        ).then(() => {
-          devLog('✅ Finished pre-fetching team members for all equipment');
-        });
+            if (Object.keys(updates).length > 0) {
+              setAllEquipmentTeamMembers(prev => ({ ...prev, ...updates }));
+            }
+            devLog('✅ Finished pre-fetching team members for all equipment');
+          }).catch((error) => {
+            devError('❌ Error pre-fetching team members (non-fatal):', error);
+          });
+        }
       }
 
       // Initialize technical sections for each equipment
@@ -1098,16 +1092,6 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       });
       // // console.log('Initial Team Custom Fields:', initialTeamCustomFields);
       setTeamCustomFields(initialTeamCustomFields);
-
-      // Debug: Check all documents in database first
-      const debugDocuments = async () => {
-        try {
-          const allDocs = await fastAPI.getAllDocuments();
-        } catch (error) {
-          console.error('❌ DEBUG: Error fetching all documents:', error);
-        }
-      };
-      debugDocuments();
 
       // Load documents for all equipment
       loadDocumentsForEquipment(transformedEquipment);
@@ -1836,7 +1820,20 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
   // This must be AFTER refreshEquipmentData is defined
   // NOTE: For project_manager, vdcr_manager, editors/viewers with filtered equipment, we should NOT refresh from database
   // as it would override the filtered equipment. Instead, we rely on the filtered equipment prop.
+  // NOTE: For standalone equipment, the parent (Index) loads data when user clicks the tab; do not duplicate fetch here.
   useEffect(() => {
+    // Standalone: parent owns the data and fetches only when user opens the tab – skip to avoid duplicate requests
+    if (projectId === 'standalone') return;
+
+    // When parent already passed full equipment (e.g. from cache with progress data), skip duplicate fetch
+    if (equipment && Array.isArray(equipment) && equipment.length > 0) {
+      const first = equipment[0] as any;
+      const hasProgressData = (first.progress_entries && first.progress_entries.length > 0) ||
+        (first.progress_images_metadata && first.progress_images_metadata.length > 0) ||
+        (first.progress_images && first.progress_images.length > 0);
+      if (hasProgressData) return;
+    }
+
     // Only refresh if we're not using filtered equipment (i.e., for firm_admin only)
     // For project_manager, vdcr_manager, editors/viewers, the equipment prop is already filtered by assignment
     const userRole = localStorage.getItem('userRole') || '';
@@ -1850,14 +1847,14 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       // The equipment prop is already filtered, so we don't need to fetch from database
       // console.log('🔄 EquipmentGrid: Skipping refreshEquipmentData for filtered user, using filtered equipment prop');
     }
-  }, [projectId, refreshEquipmentData]);
+  }, [projectId, refreshEquipmentData, equipment]);
   
   // Reset pagination to page 1 when filters change or when switching between project and standalone
   useEffect(() => {
     setCurrentPage(1);
   }, [selectedPhase, searchQuery, projectId]);
 
-  // When on-demand is on: fill latest progress image for the *visible* page when user changes page or filters
+  // When on-demand is on: fill latest progress image for the *visible* page (batched: one API call for all needLatest)
   useEffect(() => {
     if (!USE_ON_DEMAND_PROGRESS_IMAGES || !localEquipment.length) return;
     const visibleList = getFilteredAndSortedEquipment(localEquipment, selectedPhase, searchQuery);
@@ -1866,16 +1863,21 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     const needLatest = visiblePage.filter(eq => eq.progressImagesMetadata?.length && !eq.progressImages?.[0]);
     if (needLatest.length === 0) return;
     const isStandalone = projectId === 'standalone';
-    needLatest.forEach(eq => {
-      fastAPI.getLatestProgressImageUrl(eq.id, isStandalone).then(url => {
-        if (!url) return;
-        setLocalEquipment(prev => prev.map(e => {
-          if (e.id !== eq.id) return e;
-          const next = [...(e.progressImages || [])];
-          if (next.length > 0) next[0] = url;
-          return { ...e, progressImages: next };
-        }));
-      });
+    const ids = needLatest.map((eq) => eq.id);
+    fastAPI.getLatestProgressImageUrlsBatch(ids, isStandalone).then((urlMap) => {
+      const updates = new Map<string, string>();
+      for (const id of ids) {
+        const url = urlMap[id];
+        if (url) updates.set(id, url);
+      }
+      if (updates.size === 0) return;
+      setLocalEquipment(prev => prev.map(e => {
+        const url = updates.get(e.id);
+        if (!url) return e;
+        const next = [...(e.progressImages || [])];
+        if (next.length > 0) next[0] = url;
+        return { ...e, progressImages: next };
+      }));
     });
   }, [currentPage, localEquipment.length, projectId, itemsPerPage, selectedPhase, searchQuery, getFilteredAndSortedEquipment]);
 
@@ -1953,9 +1955,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       }
     };
     
-    // Pre-cache next page when current page changes
+    // Pre-cache next page when current page or list length changes (not when only progress image URL is updated)
     preCacheNextPage();
-  }, [currentPage, localEquipment, projectId, itemsPerPage]);
+  }, [currentPage, localEquipment.length, projectId, itemsPerPage]);
 
   const [documents, setDocuments] = useState<Record<string, Array<{ id: string, file?: File, name: string, uploadedBy: string, uploadDate: string, document_url?: string, document_name?: string }>>>({});
   const [newDocumentName, setNewDocumentName] = useState('');
@@ -2045,15 +2047,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     });
   }, [projectId, toast, fetchAndSetBlobUrl]);
 
-  // Fetch documents for all equipment when component mounts
-  useEffect(() => {
-    if (equipment && equipment.length > 0) {
-      // // console.log('📄 Fetching documents for all equipment...');
-      equipment.forEach((item) => {
-        fetchEquipmentDocuments(item.id);
-      });
-    }
-  }, [equipment]);
+  // Initial document load for all equipment is done in the main equipment useEffect via loadDocumentsForEquipment(transformedEquipment).
+  // Do NOT add a second effect that loops equipment and calls fetchEquipmentDocuments(item.id) — that caused 2N duplicate API calls.
 
   // Pre-fetch team members for all project equipment when equipment list loads (equipment_team_positions)
   useEffect(() => {
@@ -8125,7 +8120,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               </div>
               <div>
                 <Label className="text-xs text-gray-700">Upload image (optional)</Label>
-                <div className="flex flex-row gap-2 mt-2 flex-wrap" onClick={e => e.stopPropagation()} onTouchStart={e => e.stopPropagation()} onTouchEnd={e => e.stopPropagation()}>
+                <div className="flex flex-row items-center gap-2 mt-1.5 flex-wrap" onClick={e => e.stopPropagation()} onTouchStart={e => e.stopPropagation()} onTouchEnd={e => e.stopPropagation()}>
                   <input
                     ref={markCompleteCameraInputRef}
                     type="file"
@@ -8149,44 +8144,25 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                     className="hidden"
                     id="mark-complete-gallery-details"
                   />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md border border-gray-300 bg-white text-xs font-medium text-gray-700 hover:bg-gray-50 h-auto"
-                    onClick={e => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      markCompleteCameraInputRef.current?.click();
-                    }}
-                    onTouchEnd={e => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      markCompleteCameraInputRef.current?.click();
-                    }}
+                  <label
+                    htmlFor="mark-complete-camera-details"
+                    className="cursor-pointer inline-flex items-center gap-1.5 rounded border border-gray-300 bg-gray-100 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-200"
+                    onClick={e => e.stopPropagation()}
                   >
-                    <Camera size={16} />
+                    <Camera className="w-4 h-4" />
                     Camera
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md border border-gray-300 bg-white text-xs font-medium text-gray-700 hover:bg-gray-50 h-auto"
-                    onClick={e => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      markCompleteGalleryInputRef.current?.click();
-                    }}
-                    onTouchEnd={e => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      markCompleteGalleryInputRef.current?.click();
-                    }}
+                  </label>
+                  <label
+                    htmlFor="mark-complete-gallery-details"
+                    className="cursor-pointer inline-flex items-center gap-1.5 rounded border border-gray-300 bg-gray-100 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-200"
+                    onClick={e => e.stopPropagation()}
                   >
-                    <Image size={16} />
-                    Gallery
-                  </Button>
+                    <Upload className="w-4 h-4" />
+                    Choose file
+                  </label>
+                  <span className="text-sm text-gray-500">
+                    {markCompleteModalData.imageFile ? markCompleteModalData.imageFile.name : 'No file chosen'}
+                  </span>
                 </div>
               </div>
             </div>
@@ -8261,15 +8237,26 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       {/* Activities History modal - details view */}
       {activitiesHistoryOpen && activitiesHistoryEquipmentId && (() => {
         const list = equipmentActivities[activitiesHistoryEquipmentId] || [];
+        const equipment = localEquipment.find((eq: Equipment) => eq.id === activitiesHistoryEquipmentId);
+        const commencementDate = (equipment as any)?.commencementDate ?? (equipment as any)?.commencement_date ?? null;
+        const getDisplayTargetDate = (act: any) => {
+          const raw = act.target_date ?? act.targetDate;
+          if (raw) return raw;
+          const fromRelative = parseExplicitTargetDate(act.target_relative ?? act.targetRelative);
+          if (fromRelative) return fromRelative;
+          if (commencementDate && (act.target_relative ?? act.targetRelative))
+            return computeTargetDate(commencementDate, act.target_relative ?? act.targetRelative) ?? undefined;
+          return undefined;
+        };
         const formatDate = (d: string | undefined) => (d ? new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '—');
         const getVarianceDays = (target: string | undefined, completedOn: string | undefined) => {
           if (!target || !completedOn) return null;
           const t = new Date(target); const c = new Date(completedOn);
           return Math.round((c.getTime() - t.getTime()) / (1000 * 60 * 60 * 24));
         };
-        const getTrackStatus = (act: any) => {
+        const getTrackStatus = (act: any, displayTargetDate: string | undefined) => {
           if (!act.completion) return { text: 'Pending', className: 'text-gray-500' };
-          const v = getVarianceDays(act.target_date, act.completion?.completed_on);
+          const v = getVarianceDays(displayTargetDate, act.completion?.completed_on);
           if (v === null) return { text: '—', className: 'text-gray-500' };
           if (v <= 0) return { text: v === 0 ? 'On track' : `${Math.abs(v)} days early`, className: 'text-green-600' };
           return { text: `${v} days delay`, className: 'text-amber-600' };
@@ -8301,8 +8288,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 </thead>
                 <tbody>
                   {list.map((act: any) => {
-                    const variance = act.completion && act.target_date ? getVarianceDays(act.target_date, act.completion.completed_on) : null;
-                    const track = getTrackStatus(act);
+                    const displayTargetDate = getDisplayTargetDate(act);
+                    const variance = act.completion && displayTargetDate ? getVarianceDays(displayTargetDate, act.completion.completed_on) : null;
+                    const track = getTrackStatus(act, displayTargetDate);
                     return (
                       <tr key={act.id} className="border-b border-gray-100 hover:bg-gray-50/50">
                         <td className="py-2 px-2">{act.sr_no}</td>
@@ -8311,7 +8299,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                         <td className="py-2 px-2 text-gray-600">{act.completion?.completed_by_display_name ?? '—'}</td>
                         <td className="py-2 px-2 text-gray-600">{formatDate(act.completion?.completed_on)}</td>
                         <td className="py-2 px-2 text-gray-600">{act.completion?.updated_on ? formatDate(act.completion.updated_on) : '—'}</td>
-                        <td className="py-2 px-2 text-gray-600">{formatDate(act.target_date)}</td>
+                        <td className="py-2 px-2 text-gray-600">{formatDate(displayTargetDate)}</td>
                         <td className="py-2 px-2">{variance !== null ? (variance > 0 ? `+${variance}` : variance) : '—'}</td>
                         <td className={`py-2 px-2 font-medium ${track.className}`}>{track.text}</td>
                       </tr>
@@ -8943,7 +8931,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                       // Edit Mode - Upload new progress image
                       <div className="space-y-3">
                         <div className="text-sm font-medium text-gray-700">Progress Image</div>
-                        <div className="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center" onClick={e => e.stopPropagation()}>
+                        <div className="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center space-y-3" onClick={e => e.stopPropagation()}>
                           <input
                             type="file"
                             accept="image/*"
@@ -8967,23 +8955,26 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                             className="hidden"
                             id={`progress-img-gallery-${item.id}`}
                           />
-                          <div className="flex flex-row gap-2 justify-center flex-wrap">
-                            <label htmlFor={`progress-img-camera-${item.id}`} className="cursor-pointer inline-flex items-center gap-1.5 px-3 py-2 rounded-md border border-gray-300 bg-white text-xs font-medium text-gray-700 hover:bg-gray-50" onClick={e => e.stopPropagation()}>
-                              <Camera size={16} />
-                              Camera
+                          <div className="flex flex-wrap items-center justify-center gap-3 py-4">
+                            <label
+                              htmlFor={`progress-img-camera-${item.id}`}
+                              className="cursor-pointer inline-flex flex-col items-center gap-2 rounded-lg border border-gray-300 bg-gray-50 px-4 py-3 text-gray-600 hover:bg-gray-100 hover:text-gray-800 min-w-[120px]"
+                              onClick={e => e.stopPropagation()}
+                            >
+                              <Camera className="w-10 h-10 text-gray-500" />
+                              <span className="text-sm font-medium">Camera</span>
                             </label>
-                            <label htmlFor={`progress-img-gallery-${item.id}`} className="cursor-pointer inline-flex items-center gap-1.5 px-3 py-2 rounded-md border border-gray-300 bg-white text-xs font-medium text-gray-700 hover:bg-gray-50" onClick={e => e.stopPropagation()}>
-                              <Image size={16} />
-                              Gallery
+                            <label
+                              htmlFor={`progress-img-gallery-${item.id}`}
+                              className="cursor-pointer inline-flex flex-col items-center gap-2 rounded-lg border border-gray-300 bg-gray-50 px-4 py-3 text-gray-600 hover:bg-gray-100 hover:text-gray-800 min-w-[120px]"
+                              onClick={e => e.stopPropagation()}
+                            >
+                              <Upload className="w-10 h-10 text-gray-500" />
+                              <span className="text-sm font-medium">Choose file</span>
                             </label>
                           </div>
-                          {newProgressImage && (
-                            <div className="text-xs text-green-600 mt-2">
-                              Selected: {newProgressImage.name}
-                            </div>
-                          )}
                         </div>
-                        <div className="relative">
+                        <div className="relative mt-3">
                           <Input
                             placeholder="Describe what this image shows (required)..."
                             value={imageDescription}
@@ -9568,7 +9559,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                                           )}
                                         </div>
                                       </div>
-                                      <div className="flex justify-start gap-1 sm:gap-2 flex-wrap">
+                                      <div className="flex justify-between gap-1 sm:gap-2 flex-wrap">
                                         <Button type="button" size="sm" variant="outline" className="text-[10px] sm:text-xs h-6 sm:h-7 px-1.5 sm:px-2" onClick={() => exportActivitiesReport(item.id)}>
                                           <Download className="w-2.5 h-2.5 sm:w-3 sm:h-3 mr-0.5 sm:mr-1" />
                                           Export report
@@ -10661,31 +10652,30 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                                   </div>
                                 </div>
                               )}
-                              <div>
+                              <div className="col-span-3">
                                 <Label className="text-xs text-gray-600">Image</Label>
-                                <div className="space-y-2">
-                                  {/* Show existing image preview when editing */}
-                                  {editingProgressEntryId && typeof newProgressImage === 'string' && newProgressImage && (
-                                    <div className="relative">
-                                      <img
-                                        src={newProgressImage}
-                                        alt="Existing progress image"
-                                        className="w-24 h-24 object-cover rounded-lg border border-gray-200"
-                                      />
-                                      {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
-                                        <button
-                                          onClick={() => setNewProgressImage(null)}
-                                          className="absolute -top-2 -right-2 w-5 h-5 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center text-xs"
-                                          title="Remove image"
-                                        >
-                                          <X className="w-3 h-3" />
-                                        </button>
-                                      )}
-                                      <p className="text-xs text-gray-500 mt-1">Current image (click below to replace)</p>
-                                    </div>
-                                  )}
+                                {editingProgressEntryId && typeof newProgressImage === 'string' && newProgressImage && (
+                                  <div className="relative mt-1 mb-2">
+                                    <img
+                                      src={newProgressImage}
+                                      alt="Existing progress image"
+                                      className="w-24 h-24 object-cover rounded-lg border border-gray-200"
+                                    />
+                                    {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
+                                      <button
+                                        onClick={() => setNewProgressImage(null)}
+                                        className="absolute -top-2 -right-2 w-5 h-5 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center text-xs"
+                                        title="Remove image"
+                                      >
+                                        <X className="w-3 h-3" />
+                                      </button>
+                                    )}
+                                    <p className="text-xs text-gray-500 mt-1">Current image (click below to replace)</p>
+                                  </div>
+                                )}
+                                <div className="mt-1 flex flex-row items-center gap-2" onClick={e => e.stopPropagation()} onTouchStart={e => e.stopPropagation()} onTouchEnd={e => e.stopPropagation()}>
                                   {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' ? (
-                                    <div className="flex flex-row gap-2 flex-wrap" onClick={e => e.stopPropagation()} onTouchStart={e => e.stopPropagation()} onTouchEnd={e => e.stopPropagation()}>
+                                    <>
                                       <input
                                         ref={el => { entryImgCameraRefs.current[item.id] = el; }}
                                         type="file"
@@ -10711,47 +10701,19 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                                         className="hidden"
                                         id={`entry-img-gallery-${item.id}`}
                                       />
-                                      <Button
-                                        type="button"
-                                        variant="outline"
-                                        size="sm"
-                                        className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md border border-gray-300 bg-white text-xs font-medium text-gray-700 hover:bg-gray-50 h-auto"
-                                        onClick={e => {
-                                          e.preventDefault();
-                                          e.stopPropagation();
-                                          entryImgCameraRefs.current[item.id]?.click();
-                                        }}
-                                        onTouchEnd={e => {
-                                          e.preventDefault();
-                                          e.stopPropagation();
-                                          entryImgCameraRefs.current[item.id]?.click();
-                                        }}
+                                      <label
+                                        htmlFor={`entry-img-gallery-${item.id}`}
+                                        className="cursor-pointer inline-block rounded border border-gray-300 bg-gray-100 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-200"
+                                        onClick={e => e.stopPropagation()}
                                       >
-                                        <Camera size={16} />
-                                        Camera
-                                      </Button>
-                                      <Button
-                                        type="button"
-                                        variant="outline"
-                                        size="sm"
-                                        className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md border border-gray-300 bg-white text-xs font-medium text-gray-700 hover:bg-gray-50 h-auto"
-                                        onClick={e => {
-                                          e.preventDefault();
-                                          e.stopPropagation();
-                                          entryImgGalleryRefs.current[item.id]?.click();
-                                        }}
-                                        onTouchEnd={e => {
-                                          e.preventDefault();
-                                          e.stopPropagation();
-                                          entryImgGalleryRefs.current[item.id]?.click();
-                                        }}
-                                      >
-                                        <Image size={16} />
-                                        Gallery
-                                      </Button>
-                                    </div>
+                                        Choose File
+                                      </label>
+                                      <span className="text-sm text-gray-500">
+                                        {newProgressImage && typeof newProgressImage !== 'string' ? newProgressImage.name : 'No file chosen'}
+                                      </span>
+                                    </>
                                   ) : (
-                                    <div className="text-xs text-gray-500 italic">Image upload not available</div>
+                                    <span className="text-xs text-gray-500 italic">Image upload not available</span>
                                   )}
                                 </div>
                               </div>
@@ -11065,51 +11027,53 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                         {editingEquipmentId === item.id ? (
                           // Edit Mode - Upload Documents
                           <div className="space-y-3">
-                            <div className="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center" onClick={e => e.stopPropagation()}>
-                              <FileText size={24} className="mx-auto text-gray-400 mb-2" />
-                              <div className="text-sm text-gray-600">
-                                Upload documents or images
-                              </div>
-                              <div className="text-xs text-gray-500 mt-1">
-                                PDF, DOC, XLS, DWG, Images supported
-                              </div>
-                              {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
-                                <div className="flex flex-row gap-2 justify-center mt-3 flex-wrap">
-                                  <input
-                                    type="file"
-                                    accept="image/*"
-                                    capture="environment"
-                                    onChange={(e) => {
-                                      const files = Array.from(e.target.files || []);
-                                      if (files.length > 0) handleDocumentUpload(item.id, files);
-                                      e.target.value = '';
-                                    }}
-                                    className="hidden"
-                                    id={`doc-camera-${item.id}`}
-                                  />
-                                  <input
-                                    type="file"
-                                    multiple
-                                    accept=".pdf,.doc,.docx,.xls,.xlsx,.dwg,.dxf,.jpg,.jpeg,.png,image/*"
-                                    onChange={(e) => {
-                                      const files = Array.from(e.target.files || []);
-                                      if (files.length > 0) handleDocumentUpload(item.id, files);
-                                      e.target.value = '';
-                                    }}
-                                    className="hidden"
-                                    id={`doc-gallery-${item.id}`}
-                                  />
-                                  <label htmlFor={`doc-camera-${item.id}`} className="cursor-pointer inline-flex items-center gap-1.5 px-3 py-2 rounded-md border border-gray-300 bg-white text-xs font-medium text-gray-700 hover:bg-gray-50" onClick={e => e.stopPropagation()}>
-                                    <Camera size={16} />
-                                    Camera
-                                  </label>
-                                  <label htmlFor={`doc-gallery-${item.id}`} className="cursor-pointer inline-flex items-center gap-1.5 px-3 py-2 rounded-md border border-gray-300 bg-white text-xs font-medium text-gray-700 hover:bg-gray-50" onClick={e => e.stopPropagation()}>
-                                    <Image size={16} />
-                                    Gallery
-                                  </label>
-                                </div>
-                              )}
+                            <div className="border-2 border-dashed border-gray-300 rounded-lg bg-gray-50 p-6 text-center" onClick={e => e.stopPropagation()}>
+                              <input
+                                type="file"
+                                accept="image/*"
+                                capture="environment"
+                                onChange={(e) => {
+                                  const files = Array.from(e.target.files || []);
+                                  if (files.length > 0) handleDocumentUpload(item.id, files);
+                                  e.target.value = '';
+                                }}
+                                className="hidden"
+                                id={`doc-camera-${item.id}`}
+                              />
+                              <input
+                                type="file"
+                                multiple
+                                accept=".pdf,.doc,.docx,.xls,.xlsx,.dwg,.dxf,.jpg,.jpeg,.png,image/*"
+                                onChange={(e) => {
+                                  const files = Array.from(e.target.files || []);
+                                  if (files.length > 0) handleDocumentUpload(item.id, files);
+                                  e.target.value = '';
+                                }}
+                                className="hidden"
+                                id={`doc-gallery-${item.id}`}
+                              />
+                              <label
+                                htmlFor={`doc-gallery-${item.id}`}
+                                className="cursor-pointer flex flex-col items-center justify-center gap-1.5 py-3 text-gray-600 hover:text-gray-800"
+                                onClick={e => e.stopPropagation()}
+                              >
+                                <FileText size={28} className="mx-auto text-gray-400" strokeWidth={1.5} />
+                                <div className="text-sm font-medium text-gray-600">Click to upload documents</div>
+                                <div className="text-xs text-gray-500">PDF, DOC, XLS, DWG, Images supported</div>
+                              </label>
                             </div>
+                            {currentUserRole !== 'vdcr_manager' && currentUserRole !== 'viewer' && (
+                              <div className="flex flex-row items-center gap-2" onClick={e => e.stopPropagation()}>
+                                <label
+                                  htmlFor={`doc-gallery-${item.id}`}
+                                  className="cursor-pointer inline-block rounded border border-gray-300 bg-gray-100 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-200"
+                                  onClick={e => e.stopPropagation()}
+                                >
+                                  Choose Files
+                                </label>
+                                <span className="text-sm text-gray-500">No file chosen</span>
+                              </div>
+                            )}
 
                             {/* Existing Equipment Documents Display */}
                             {documents[item.id] && documents[item.id]
@@ -11119,7 +11083,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                                 return !coreDocumentTypes.includes(doc.document_type || '');
                               })
                               .length > 0 && (
-                              <div className="mt-2 p-3 bg-green-50 border border-green-200 rounded-md">
+                              <div className="mt-2 p-3 bg-green-50 border border-green-200 border-t-2 border-t-green-300 rounded-md">
                                 <p className="text-sm font-medium text-green-800 mb-2">Existing Equipment Documents:</p>
                                 <div className="space-y-1">
                                   {documents[item.id]
@@ -12361,7 +12325,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               </div>
               <div>
                 <Label className="text-xs text-gray-700">Upload image (optional)</Label>
-                <div className="flex flex-row gap-2 mt-2 flex-wrap" onClick={e => e.stopPropagation()} onTouchStart={e => e.stopPropagation()} onTouchEnd={e => e.stopPropagation()}>
+                <div className="flex flex-row items-center gap-2 mt-1.5 flex-wrap" onClick={e => e.stopPropagation()} onTouchStart={e => e.stopPropagation()} onTouchEnd={e => e.stopPropagation()}>
                   <input
                     ref={markCompleteCameraInputRef}
                     type="file"
@@ -12385,44 +12349,25 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                     className="hidden"
                     id="mark-complete-gallery-grid"
                   />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md border border-gray-300 bg-white text-xs font-medium text-gray-700 hover:bg-gray-50 h-auto"
-                    onClick={e => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      markCompleteCameraInputRef.current?.click();
-                    }}
-                    onTouchEnd={e => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      markCompleteCameraInputRef.current?.click();
-                    }}
+                  <label
+                    htmlFor="mark-complete-camera-grid"
+                    className="cursor-pointer inline-flex items-center gap-1.5 rounded border border-gray-300 bg-gray-100 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-200"
+                    onClick={e => e.stopPropagation()}
                   >
-                    <Camera size={16} />
+                    <Camera className="w-4 h-4" />
                     Camera
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md border border-gray-300 bg-white text-xs font-medium text-gray-700 hover:bg-gray-50 h-auto"
-                    onClick={e => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      markCompleteGalleryInputRef.current?.click();
-                    }}
-                    onTouchEnd={e => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      markCompleteGalleryInputRef.current?.click();
-                    }}
+                  </label>
+                  <label
+                    htmlFor="mark-complete-gallery-grid"
+                    className="cursor-pointer inline-flex items-center gap-1.5 rounded border border-gray-300 bg-gray-100 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-200"
+                    onClick={e => e.stopPropagation()}
                   >
-                    <Image size={16} />
-                    Gallery
-                  </Button>
+                    <Upload className="w-4 h-4" />
+                    Choose file
+                  </label>
+                  <span className="text-sm text-gray-500">
+                    {markCompleteModalData.imageFile ? markCompleteModalData.imageFile.name : 'No file chosen'}
+                  </span>
                 </div>
               </div>
             </div>
@@ -12497,15 +12442,26 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       {/* Activities History modal */}
       {activitiesHistoryOpen && activitiesHistoryEquipmentId && (() => {
         const list = equipmentActivities[activitiesHistoryEquipmentId] || [];
+        const equipment = localEquipment.find((eq: Equipment) => eq.id === activitiesHistoryEquipmentId);
+        const commencementDate = (equipment as any)?.commencementDate ?? (equipment as any)?.commencement_date ?? null;
+        const getDisplayTargetDate = (act: any) => {
+          const raw = act.target_date ?? act.targetDate;
+          if (raw) return raw;
+          const fromRelative = parseExplicitTargetDate(act.target_relative ?? act.targetRelative);
+          if (fromRelative) return fromRelative;
+          if (commencementDate && (act.target_relative ?? act.targetRelative))
+            return computeTargetDate(commencementDate, act.target_relative ?? act.targetRelative) ?? undefined;
+          return undefined;
+        };
         const formatDate = (d: string | undefined) => (d ? new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '—');
         const getVarianceDays = (target: string | undefined, completedOn: string | undefined) => {
           if (!target || !completedOn) return null;
           const t = new Date(target); const c = new Date(completedOn);
           return Math.round((c.getTime() - t.getTime()) / (1000 * 60 * 60 * 24));
         };
-        const getTrackStatus = (act: any) => {
+        const getTrackStatus = (act: any, displayTargetDate: string | undefined) => {
           if (!act.completion) return { text: 'Pending', className: 'text-gray-500' };
-          const v = getVarianceDays(act.target_date, act.completion?.completed_on);
+          const v = getVarianceDays(displayTargetDate, act.completion?.completed_on);
           if (v === null) return { text: '—', className: 'text-gray-500' };
           if (v <= 0) return { text: v === 0 ? 'On track' : `${Math.abs(v)} days early`, className: 'text-green-600' };
           return { text: `${v} days delay`, className: 'text-amber-600' };
@@ -12537,8 +12493,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 </thead>
                 <tbody>
                   {list.map((act: any) => {
-                    const variance = act.completion && act.target_date ? getVarianceDays(act.target_date, act.completion.completed_on) : null;
-                    const track = getTrackStatus(act);
+                    const displayTargetDate = getDisplayTargetDate(act);
+                    const variance = act.completion && displayTargetDate ? getVarianceDays(displayTargetDate, act.completion.completed_on) : null;
+                    const track = getTrackStatus(act, displayTargetDate);
                     return (
                       <tr key={act.id} className="border-b border-gray-100 hover:bg-gray-50/50">
                         <td className="py-2 px-2">{act.sr_no}</td>
@@ -12547,7 +12504,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                         <td className="py-2 px-2 text-gray-600">{act.completion?.completed_by_display_name ?? '—'}</td>
                         <td className="py-2 px-2 text-gray-600">{formatDate(act.completion?.completed_on)}</td>
                         <td className="py-2 px-2 text-gray-600">{act.completion?.updated_on ? formatDate(act.completion.updated_on) : '—'}</td>
-                        <td className="py-2 px-2 text-gray-600">{formatDate(act.target_date)}</td>
+                        <td className="py-2 px-2 text-gray-600">{formatDate(displayTargetDate)}</td>
                         <td className="py-2 px-2">{variance !== null ? (variance > 0 ? `+${variance}` : variance) : '—'}</td>
                         <td className={`py-2 px-2 font-medium ${track.className}`}>{track.text}</td>
                       </tr>

@@ -273,32 +273,50 @@ const Index = () => {
     }
   }, [authFirmId, authUserRole, authFirmData]);
 
-  // Fetch projects from Supabase on component mount
-  // Wait for AuthContext to finish loading, but use localStorage if available
+  // Refs to avoid frontend loop: double-fetch on load and refetch on every tab focus
+  const projectsFetchTriggeredRef = useRef(false);
+  const isProjectsFetchInProgressRef = useRef(false); // burst Refresh clicks → only one request
+  // Once standalone equipment has been loaded, keep using state when switching back to tab (no refetch)
+  const standaloneDataLoadedRef = useRef(false);
+  // Preserve Projects pagination when switching main tabs (e.g. Projects page 2 -> Standalone -> back to Projects = stay on page 2)
+  const projectsPageWhenLeftRef = useRef<number | null>(null);
+
+  // Reset fetch flags when auth is loading (e.g. logout) so next login triggers fresh fetches
+  useEffect(() => {
+    if (authLoading) {
+      projectsFetchTriggeredRef.current = false;
+      standaloneDataLoadedRef.current = false;
+    }
+  }, [authLoading]);
+
+  // Fetch projects only when auth is ready. No refetch on tab focus — fresh data only on load or manual refresh.
   useEffect(() => {
     let isMounted = true;
-    
-    // Check if we have data in localStorage
-    const localStorageFirmId = JSON.parse(localStorage.getItem('userData') || '{}').firm_id || localStorage.getItem('firmId');
-    const localStorageUserRole = localStorage.getItem('userRole');
-    
-    // If AuthContext is still loading but localStorage has data, proceed anyway
+
+    // Wait for AuthContext to finish loading - do NOT fetch while authLoading is true (prevents double fetch)
     if (authLoading) {
-      if (localStorageFirmId && localStorageUserRole) {
-        // Continue to fetch - don't return
-      } else {
-        return;
-      }
+      return;
     }
 
-    // Only fetch when tab is visible (no background API)
+    const localStorageFirmId = JSON.parse(localStorage.getItem('userData') || '{}').firm_id || localStorage.getItem('firmId');
+    const localStorageUserRole = localStorage.getItem('userRole');
+    if (!localStorageFirmId || !localStorageUserRole) {
+      return;
+    }
+
     if (!isWindowVisible) {
       setLoading(false);
       return;
     }
 
-    // Fetch and load projects from Supabase database
+    if (projectsFetchTriggeredRef.current) {
+      return;
+    }
+    projectsFetchTriggeredRef.current = true;
+
     const fetchProjectsFromSupabase = async () => {
+      if (isProjectsFetchInProgressRef.current) return;
+      isProjectsFetchInProgressRef.current = true;
       try {
         // Get firmId from AuthContext or localStorage (fallback)
         const firmId = authFirmId || JSON.parse(localStorage.getItem('userData') || '{}').firm_id || localStorage.getItem('firmId');
@@ -326,6 +344,8 @@ const Index = () => {
       } catch (error) {
         console.error('❌ Error fetching projects from Supabase:', error);
         setLoading(false);
+      } finally {
+        isProjectsFetchInProgressRef.current = false;
       }
     };
 
@@ -510,9 +530,9 @@ const Index = () => {
       fetchProjectsRef.current = null;
     };
     
-    // Run when auth resolves or when tab becomes visible (no fetch in background)
+    // Only when auth becomes ready. No refetch on tab focus — use manual refresh for fresh data.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authLoading, isWindowVisible]);
+  }, [authLoading]);
 
   // Apply filters when projects change
   useEffect(() => {
@@ -577,9 +597,15 @@ const Index = () => {
     }
   }, [equipmentLock?.isLocked, mainTab]);
 
-  // Fetch standalone equipment only when equipment tab is active AND window is visible (no background API)
+  // Fetch standalone equipment only when user opens the Equipment tab. Once loaded, preserve in state – no refetch when switching back.
   useEffect(() => {
     if (mainTab !== 'equipment' || !isWindowVisible) return;
+
+    // Already loaded in this session – use existing state, no new requests
+    if (standaloneDataLoadedRef.current) {
+      setStandaloneEquipmentLoading(false);
+      return;
+    }
 
     const cacheKey = `${CACHE_KEYS.EQUIPMENT}_standalone`;
     const cachedEquipment = getCache<any[]>(cacheKey);
@@ -592,6 +618,7 @@ const Index = () => {
         if (cachedEquipment !== null && Array.isArray(cachedEquipment) && cachedEquipment.length > 0) {
           const limitedCached = cachedEquipment.slice(0, 24);
           setStandaloneEquipment(limitedCached);
+          standaloneDataLoadedRef.current = true;
           setStandaloneEquipmentLoading(false);
           const count = limitedCached.length;
           const prevCounters = getCache<{ projects: number; standaloneEquipment: number; completionCertificates: number }>(CACHE_KEYS.TAB_COUNTERS);
@@ -608,7 +635,7 @@ const Index = () => {
           setStandaloneEquipmentLoading(false);
         }
 
-        // Single fetch (tab is active and visible)
+        // Single fetch (tab is active and visible, first time in this session)
         const equipment = await fastAPI.getStandaloneEquipment();
 
         if (equipment && Array.isArray(equipment) && equipment.length > 0) {
@@ -637,6 +664,7 @@ const Index = () => {
             maxSize: 2 * 1024 * 1024,
           });
           setStandaloneEquipment(first24);
+          standaloneDataLoadedRef.current = true;
           const count = first24.length;
           const prevCounters = getCache<{ projects: number; standaloneEquipment: number; completionCertificates: number }>(CACHE_KEYS.TAB_COUNTERS);
           const tabCounters = prevCounters ? { ...prevCounters, standaloneEquipment: count } : { projects: 0, standaloneEquipment: count, completionCertificates: 0 };
@@ -644,6 +672,7 @@ const Index = () => {
           setCache(CACHE_KEYS.TAB_COUNTERS, tabCounters, { ttl: 24 * 60 * 60 * 1000 });
         } else if (standaloneEquipment.length === 0) {
           setStandaloneEquipment([]);
+          standaloneDataLoadedRef.current = true;
         }
       } catch (error) {
         console.error('❌ Error fetching standalone equipment:', error);
@@ -755,70 +784,52 @@ const Index = () => {
   const endProjectIndex = startProjectIndex + itemsPerPage;
   const paginatedProjects = currentProjects.slice(startProjectIndex, endProjectIndex);
   
-  // Pre-cache equipment metadata for visible projects (8 projects on current page)
-  // This runs in background - doesn't block UI, just prepares data for instant load
+  // Pre-cache equipment for the first visible project on current page (and keep per-project cache so last 2 visited pages stay valid).
+  // One project per page cached by id; when user switches page 1 <-> page 2 we don't refetch if cache allows.
   useEffect(() => {
-    const preCacheVisibleProjectsEquipment = async () => {
-      // Only pre-cache for active projects (not completed) and only the 8 visible ones
-      const visibleActiveProjects = paginatedProjects.filter((p: any) => p.status !== 'completed');
-      
-      if (visibleActiveProjects.length === 0) return;
-      
-      // Pre-cache equipment metadata for each visible project in background (non-blocking)
-      visibleActiveProjects.forEach(async (project: any) => {
-        try {
-          const cacheKey = `${CACHE_KEYS.EQUIPMENT}_${project.id}`;
-          
-          // Check if already cached
-          const cached = getCache<any[]>(cacheKey);
-          if (cached !== null) {
-            // Already cached, skip
-            return;
-          }
-          
-          // Fetch equipment metadata in background (non-blocking)
-          const equipment = await fastAPI.getEquipmentByProject(project.id);
-          if (equipment && Array.isArray(equipment) && equipment.length > 0) {
-            // Create lightweight version (metadata only, no images/audio/documents)
-            const lightweight = equipment.map((eq: any) => ({
-              ...eq,
-              progress_images: [], // Don't cache image URLs
-              progress_images_metadata: eq.progress_images_metadata?.map((img: any) => ({
-                id: img.id,
-                description: img.description,
-                uploaded_by: img.uploaded_by,
-                upload_date: img.upload_date,
-                // No image_url - load on-demand
-              })) || [],
-              progress_entries: eq.progress_entries?.map((entry: any) => ({
-                id: entry.id,
-                text: entry.text || entry.entry_text,
-                date: entry.date || entry.created_at,
-                type: entry.type,
-                created_at: entry.created_at,
-                // No audio_data - load on-demand
-              })) || [],
-              documents: [], // Don't cache documents
-              images: [], // Don't cache images
-            }));
-            
-            // Cache lightweight equipment metadata
-            setCache(cacheKey, lightweight, {
-              ttl: 5 * 60 * 1000, // 5 minutes TTL
-              maxSize: 2 * 1024 * 1024 // 2MB max per project
-            });
-          }
-        } catch (error) {
-          // Silently fail - pre-caching shouldn't break the app
-          console.warn(`Failed to pre-cache equipment for project ${project.id}:`, error);
+    if (paginatedProjects.length === 0 || mainTab !== 'projects' || selectedProject) return;
+
+    const visibleActiveProjects = paginatedProjects.filter((p: any) => p.status !== 'completed');
+    if (visibleActiveProjects.length === 0) return;
+
+    const firstProject = visibleActiveProjects[0];
+    const cacheKey = `${CACHE_KEYS.EQUIPMENT}_${firstProject.id}`;
+    if (getCache<any[]>(cacheKey) !== null) return;
+
+    const timeoutId = setTimeout(async () => {
+      try {
+        const equipment = await fastAPI.getEquipmentByProject(firstProject.id);
+        if (equipment && Array.isArray(equipment) && equipment.length > 0) {
+          const lightweight = equipment.map((eq: any) => ({
+            ...eq,
+            progress_images: [],
+            progress_images_metadata: eq.progress_images_metadata?.map((img: any) => ({
+              id: img.id,
+              description: img.description,
+              uploaded_by: img.uploaded_by,
+              upload_date: img.upload_date,
+            })) || [],
+            progress_entries: eq.progress_entries?.map((entry: any) => ({
+              id: entry.id,
+              text: entry.text || entry.entry_text,
+              date: entry.date || entry.created_at,
+              type: entry.type,
+              created_at: entry.created_at,
+            })) || [],
+            documents: [],
+            images: [],
+          }));
+          setCache(cacheKey, lightweight, {
+            ttl: 10 * 60 * 1000,
+            maxSize: 2 * 1024 * 1024,
+          });
         }
-      });
-    };
-    
-    // Only pre-cache if we have visible projects and we're on the projects tab
-    if (paginatedProjects.length > 0 && mainTab === 'projects' && !selectedProject) {
-      preCacheVisibleProjectsEquipment();
-    }
+      } catch (error) {
+        console.warn(`Failed to pre-cache equipment for project ${firstProject.id}:`, error);
+      }
+    }, 3000);
+
+    return () => clearTimeout(timeoutId);
   }, [paginatedProjects, currentPage, mainTab, selectedProject]);
 
   // Reset to page 1 when tab changes or if current page is out of bounds
@@ -1965,7 +1976,14 @@ Note: Please download the Recommendation Letter template using the link above, f
           <div className="border-b border-gray-200 overflow-x-auto overflow-y-hidden">
             <nav className="-mb-px flex space-x-8 min-w-max flex-nowrap px-1">
               <button
-                onClick={() => { markAsSeen('projects'); setMainTab('projects'); }}
+                onClick={() => {
+                  markAsSeen('projects');
+                  setMainTab('projects');
+                  if (projectsPageWhenLeftRef.current != null) {
+                    setCurrentPage(projectsPageWhenLeftRef.current);
+                    projectsPageWhenLeftRef.current = null;
+                  }
+                }}
                 className={`py-2 px-1 border-b-2 font-medium text-sm transition-colors flex-shrink-0 ${
                   mainTab === 'projects'
                     ? 'border-blue-500 text-blue-600'
@@ -1993,6 +2011,7 @@ Note: Please download the Recommendation Letter template using the link above, f
                     setEquipmentLockModalOpen(true);
                     return;
                   }
+                  if (mainTab === 'projects') projectsPageWhenLeftRef.current = currentPage;
                   markAsSeen('standalone_equipment');
                   setMainTab('equipment');
                 }}
@@ -2024,7 +2043,10 @@ Note: Please download the Recommendation Letter template using the link above, f
               {/* Completion Certificates conditionally render */}
               {userRole === 'firm_admin' && (
                 <button
-                  onClick={() => setMainTab('certificates')}
+                  onClick={() => {
+                    if (mainTab === 'projects') projectsPageWhenLeftRef.current = currentPage;
+                    setMainTab('certificates');
+                  }}
                   className={`py-2 px-1 border-b-2 font-medium text-sm transition-colors flex-shrink-0 ${
                     mainTab === 'certificates'
                       ? 'border-orange-500 text-orange-600'
@@ -2041,7 +2063,10 @@ Note: Please download the Recommendation Letter template using the link above, f
               )}
 
               <button
-                onClick={() => setMainTab('tasks')}
+                onClick={() => {
+                    if (mainTab === 'projects') projectsPageWhenLeftRef.current = currentPage;
+                    setMainTab('tasks');
+                  }}
                 className={`py-2 px-1 border-b-2 font-medium text-sm transition-colors flex-shrink-0 ${
                   mainTab === 'tasks'
                     ? 'border-purple-500 text-purple-600'
@@ -2068,7 +2093,12 @@ Note: Please download the Recommendation Letter template using the link above, f
             />
 
             {/* Company Highlights Section */}
-            <CompanyHighlights onSelectProject={handleSelectProject} onMarkAsRead={markAsSeen} />
+            <CompanyHighlights
+              onSelectProject={handleSelectProject}
+              onMarkAsRead={markAsSeen}
+              initialProjectIds={filteredProjects.length > 0 ? filteredProjects.map((p: any) => p.id) : undefined}
+              isFirmAdmin={userRole === 'firm_admin'}
+            />
 
             {/* Expandable Project Filters */}
             <div className="mb-6 sm:mb-8">
@@ -2918,14 +2948,14 @@ Note: Please download the Recommendation Letter template using the link above, f
           />
         ) : null}
 
-        {/* Standalone Equipment tab: always mounted, hidden when not active – preserves cache/state when switching tabs */}
-        <div className={mainTab !== 'equipment' ? 'hidden' : ''}>
+        {/* Standalone Equipment tab: mount only when user clicks the tab – no requests until then */}
+        {mainTab === 'equipment' && (
           <StandaloneEquipmentTab
             standaloneEquipment={standaloneEquipment}
             standaloneEquipmentLoading={standaloneEquipmentLoading}
             onSummaryChange={setStandaloneEquipmentSummary}
           />
-        </div>
+        )}
 
         {/* Selected Project View - Show in Projects tab or Certificates tab */}
         {((mainTab === 'projects' || mainTab === 'certificates') && selectedProject) ? (
