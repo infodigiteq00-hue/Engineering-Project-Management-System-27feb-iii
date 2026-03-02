@@ -683,6 +683,11 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
   // Performance optimization: Debouncing and request cancellation for refreshEquipmentData
   const refreshTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const refreshAbortControllerRef = useRef<AbortController | null>(null);
+  // Ref for the projectId of the in-flight refresh (so we only abort when switching to a different project)
+  const refreshProjectIdRef = useRef<string | null>(null);
+  // Ref for current projectId so we can apply equipment response when it's still the selected project (fix: data returned but not shown)
+  const currentProjectIdRef = useRef(projectId);
+  currentProjectIdRef.current = projectId;
   // Ref to read current localEquipment length inside refreshEquipmentData without adding it to deps (avoids overwriting good data with lightweight cache)
   const localEquipmentLengthRef = useRef(0);
   localEquipmentLengthRef.current = localEquipment.length;
@@ -1099,9 +1104,12 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       // Load project members for team assignment
       loadProjectMembers();
     } else {
-      // If equipment is empty or undefined, clear localEquipment
-      // console.log('🔄 EquipmentGrid: Clearing localEquipment (empty or undefined)');
-      setLocalEquipment([]);
+      // If equipment is empty or undefined: only clear when standalone or no projectId.
+      // For project view, do NOT clear here so that refreshEquipmentData can populate localEquipment
+      // (parent often passes [] because getProjectsByFirm doesn't include full equipment; clearing would wipe data we just fetched).
+      if (projectId === 'standalone' || !projectId) {
+        setLocalEquipment([]);
+      }
     }
   }, [equipment, projectId]);
 
@@ -1476,8 +1484,8 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       refreshTimeoutRef.current = null;
     }
     
-    // Cancel any in-flight request
-    if (refreshAbortControllerRef.current) {
+    // Only abort in-flight request when switching to a different project (avoids discarding valid response for current project)
+    if (refreshAbortControllerRef.current && refreshProjectIdRef.current !== projectId) {
       refreshAbortControllerRef.current.abort();
     }
 
@@ -1485,6 +1493,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       // Create new abort controller for this request
       const abortController = new AbortController();
       refreshAbortControllerRef.current = abortController;
+      refreshProjectIdRef.current = projectId;
 
       try {
         devLog('🔄 refreshEquipmentData: Starting refresh for project:', projectId);
@@ -1497,18 +1506,18 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           ? `${CACHE_KEYS.EQUIPMENT}_standalone`
           : `${CACHE_KEYS.EQUIPMENT}_${projectId}`;
         
-        // Helper function to create lightweight equipment metadata (no images/audio/documents)
+        // Helper function to create lightweight equipment metadata (no heavy blobs).
+        // Preserve created_by_user and entry_text so Updates tab shows "Uploaded by" and description correctly from cache.
+        // Preserve first progress image URL so at least one image shows from cache.
         const createLightweightEquipment = (equipment: any[]) => {
           return equipment.map((eq: any) => ({
             ...eq,
-            // Keep only metadata, remove heavy data
-            progress_images: [], // Don't cache image URLs - load on-demand
+            progress_images: (eq.progress_images?.length && eq.progress_images[0]) ? [eq.progress_images[0]] : [],
             progress_images_metadata: eq.progress_images_metadata?.map((img: any) => ({
               id: img.id,
               description: img.description,
               uploaded_by: img.uploaded_by,
               upload_date: img.upload_date,
-              // Don't include image_url - load on-demand
             })) || [],
             progress_entries: eq.progress_entries?.map((entry: any) => ({
               id: entry.id,
@@ -1516,21 +1525,28 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               date: entry.date || entry.created_at,
               type: entry.type,
               created_at: entry.created_at,
-              // Don't include audio_data - load on-demand
+              entry_text: entry.entry_text,
+              created_by_user: entry.created_by_user,
+              users: entry.users,
+              uploadedBy: entry.uploadedBy,
             })) || [],
-            documents: [], // Don't cache documents - load on-demand
-            images: [], // Don't cache images - load on-demand
+            documents: [],
+            images: [],
           }));
         };
         
         // Check cache first for lightweight metadata
         const cachedEquipment = getCache<any[]>(cacheKey);
         if (cachedEquipment !== null && Array.isArray(cachedEquipment) && cachedEquipment.length > 0) {
-          // Only overwrite with lightweight cache when we have nothing to show. Otherwise we'd replace
-          // progress images & updates (already received from prop or initial load) with cache that has
-          // progress_images: [] and cause them to disappear for a few seconds until background fetch completes.
           const transformedCached = transformEquipmentDataCallback(cachedEquipment);
-          if (!abortController.signal.aborted && localEquipmentLengthRef.current === 0) {
+          // Only use cache when it has display-ready data (entries have created_by_user/entry_text, images when metadata exists)
+          const cacheHasDisplayReadyEntries = transformedCached.every((eq: Equipment) =>
+            !eq.progressEntries?.length || (eq.progressEntries as any[]).every((e: any) => e.created_by_user || e.entry_text || e.text)
+          );
+          const cacheHasImagesWhenMeta = transformedCached.every((eq: Equipment) =>
+            !eq.progressImagesMetadata?.length || (eq.progressImages?.length ?? 0) > 0
+          );
+          if (currentProjectIdRef.current === projectId && localEquipmentLengthRef.current === 0 && cacheHasDisplayReadyEntries && cacheHasImagesWhenMeta) {
             setLocalEquipment(transformedCached);
           }
 
@@ -1539,12 +1555,6 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             const freshEquipment = projectId === 'standalone' 
               ? await fastAPI.getStandaloneEquipment(undefined, undefined, progressImagesApiOptions) 
               : await fastAPI.getEquipmentByProject(projectId, progressImagesApiOptions);
-            
-            // Check if request was aborted
-            if (abortController.signal.aborted) {
-              devLog('⏹️ refreshEquipmentData: Request aborted');
-              return;
-            }
             
             const equipmentArray = Array.isArray(freshEquipment) ? freshEquipment : [];
             let toSet = transformEquipmentDataCallback(equipmentArray);
@@ -1561,11 +1571,11 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               maxSize: 2 * 1024 * 1024 // 2MB max per project
             });
             
-            // Update with fresh data
-            if (!abortController.signal.aborted) {
+            // Update with fresh data when response is still for the current project (fix: data returned but not shown when request was aborted)
+            if (currentProjectIdRef.current === projectId) {
               setLocalEquipment(toSet);
-              setIsLoadingProgressImages(false);
             }
+            setIsLoadingProgressImages(false);
           } catch (error) {
             // FIX: Don't clear state on error - preserve existing cached data
             console.warn('Background refresh failed for equipment:', error);
@@ -1588,10 +1598,6 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               ? await fastAPI.getStandaloneEquipment(undefined, undefined, progressImagesApiOptions) 
               : await fastAPI.getEquipmentByProject(projectId, progressImagesApiOptions);
             
-            if (abortController.signal.aborted) {
-              return;
-            }
-            
             const equipmentArray = Array.isArray(freshEquipment) ? freshEquipment : [];
             if (equipmentArray.length > 0) {
               let toSet = transformEquipmentDataCallback(equipmentArray);
@@ -1605,7 +1611,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 ttl: 24 * 60 * 60 * 1000, // 24 hours TTL
                 maxSize: 2 * 1024 * 1024
               });
-              if (!abortController.signal.aborted) {
+              if (currentProjectIdRef.current === projectId) {
                 setLocalEquipment(toSet);
               }
             }
@@ -1616,9 +1622,14 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           }
           return;
         } else if (expiredCache !== null && Array.isArray(expiredCache) && expiredCache.length > 0) {
-          // Use expired cache as fallback only when we have nothing to show (preserve progress image & updates)
           const transformedExpired = transformEquipmentDataCallback(expiredCache);
-          if (!abortController.signal.aborted && localEquipmentLengthRef.current === 0) {
+          const expiredHasDisplayReadyEntries = transformedExpired.every((eq: Equipment) =>
+            !eq.progressEntries?.length || (eq.progressEntries as any[]).every((e: any) => e.created_by_user || e.entry_text || e.text)
+          );
+          const expiredHasImagesWhenMeta = transformedExpired.every((eq: Equipment) =>
+            !eq.progressImagesMetadata?.length || (eq.progressImages?.length ?? 0) > 0
+          );
+          if (currentProjectIdRef.current === projectId && localEquipmentLengthRef.current === 0 && expiredHasDisplayReadyEntries && expiredHasImagesWhenMeta) {
             setLocalEquipment(transformedExpired);
           }
           setIsLoadingProgressImages(false);
@@ -1628,10 +1639,6 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
             const freshEquipment = projectId === 'standalone' 
               ? await fastAPI.getStandaloneEquipment(undefined, undefined, progressImagesApiOptions) 
               : await fastAPI.getEquipmentByProject(projectId, progressImagesApiOptions);
-            
-            if (abortController.signal.aborted) {
-              return;
-            }
             
             const equipmentArray = Array.isArray(freshEquipment) ? freshEquipment : [];
             if (equipmentArray.length > 0) {
@@ -1646,7 +1653,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 ttl: 24 * 60 * 60 * 1000, // 24 hours TTL
                 maxSize: 2 * 1024 * 1024
               });
-              if (!abortController.signal.aborted) {
+              if (currentProjectIdRef.current === projectId) {
                 setLocalEquipment(toSet);
               }
             }
@@ -1663,20 +1670,14 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           ? await fastAPI.getStandaloneEquipment(undefined, undefined, progressImagesApiOptions) 
           : await fastAPI.getEquipmentByProject(projectId, progressImagesApiOptions);
         
-        // Check if request was aborted
-        if (abortController.signal.aborted) {
-          devLog('⏹️ refreshEquipmentData: Request aborted');
-          return;
-        }
-        
         devLog('🔄 refreshEquipmentData: Fresh equipment data received, type:', typeof freshEquipment, 'isArray:', Array.isArray(freshEquipment));
 
         // Ensure freshEquipment is an array
         const equipmentArray = Array.isArray(freshEquipment) ? freshEquipment : [];
         devLog('🔄 refreshEquipmentData: Equipment array length:', equipmentArray.length);
         
-        // Only update if we have data - preserve existing state if fetch returns empty
-        if (equipmentArray.length > 0) {
+        // Only update if we have data and response is still for the current project (fix: data returned but not shown when request was aborted)
+        if (equipmentArray.length > 0 && currentProjectIdRef.current === projectId) {
           // Cache lightweight version (metadata only, no images/audio/documents)
           const lightweight = createLightweightEquipment(equipmentArray);
           setCache(cacheKey, lightweight, { 
@@ -1692,12 +1693,6 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           }
           const transformedEquipment = toSet;
           devLog('🔄 refreshEquipmentData: Transformed equipment count:', transformedEquipment.length);
-          
-          // Check again if request was aborted before updating state
-          if (abortController.signal.aborted) {
-            devLog('⏹️ refreshEquipmentData: Request aborted before state update');
-            return;
-          }
       
           // Post-process: For standalone equipment, ensure status is 'active' (not 'pending')
           // This handles both new equipment (which should already be 'active') and old equipment
@@ -1764,8 +1759,10 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           setTeamCustomFields(updatedTeamCustomFields);
 
           devLog('✅ refreshEquipmentData: Completed successfully');
+        } else if (equipmentArray.length === 0 && currentProjectIdRef.current === projectId) {
+          // Fetch returned empty for current project - show empty (e.g. switched to project with no equipment)
+          setLocalEquipment([]);
         }
-        // FIX: If fetch returns empty, preserve existing state - don't clear
         
         // Clear loading state for progress images
         setIsLoadingProgressImages(false);
@@ -1789,7 +1786,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           const expiredCache = getCacheEvenIfExpired<any[]>(cacheKey);
           if (expiredCache !== null && Array.isArray(expiredCache) && expiredCache.length > 0) {
             const transformedExpired = transformEquipmentDataCallback(expiredCache);
-            if (!abortController.signal.aborted) {
+            if (currentProjectIdRef.current === projectId) {
               setLocalEquipment(transformedExpired);
             }
           }
@@ -1825,7 +1822,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
     // Standalone: parent owns the data and fetches only when user opens the tab – skip to avoid duplicate requests
     if (projectId === 'standalone') return;
 
-    // When parent already passed full equipment (e.g. from cache with progress data), skip duplicate fetch
+    // When parent already passed full equipment with progress data, skip duplicate fetch
     if (equipment && Array.isArray(equipment) && equipment.length > 0) {
       const first = equipment[0] as any;
       const hasProgressData = (first.progress_entries && first.progress_entries.length > 0) ||
@@ -1834,19 +1831,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       if (hasProgressData) return;
     }
 
-    // Only refresh if we're not using filtered equipment (i.e., for firm_admin only)
-    // For project_manager, vdcr_manager, editors/viewers, the equipment prop is already filtered by assignment
-    const userRole = localStorage.getItem('userRole') || '';
-    const isFilteredUser = ['project_manager', 'vdcr_manager', 'editor', 'viewer'].includes(userRole);
-    
-    if (!isFilteredUser) {
-      // Refresh equipment data immediately on mount to fetch latest progress images
-      refreshEquipmentData(true);
-    } else {
-      // For filtered users, just ensure localEquipment is synced with the filtered equipment prop
-      // The equipment prop is already filtered, so we don't need to fetch from database
-      // console.log('🔄 EquipmentGrid: Skipping refreshEquipmentData for filtered user, using filtered equipment prop');
-    }
+    // Always refresh from API when parent didn't pass equipment (empty or missing).
+    // This fixes "No Equipment Added Yet" when getProjectsByFirm doesn't include equipment and for filtered users who were previously skipped.
+    refreshEquipmentData(true);
   }, [projectId, refreshEquipmentData, equipment]);
   
   // Reset pagination to page 1 when filters change or when switching between project and standalone
@@ -1921,10 +1908,10 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               ? freshEquipment.slice(0, 24) // Limit to 24 for standalone
               : freshEquipment;
             
-            // Create lightweight version (metadata only)
+            // Create lightweight version (preserve created_by_user/entry_text for Updates tab, first image for display)
             const lightweight = equipmentToCache.map((eq: any) => ({
               ...eq,
-              progress_images: [],
+              progress_images: (eq.progress_images?.length && eq.progress_images[0]) ? [eq.progress_images[0]] : [],
               progress_images_metadata: eq.progress_images_metadata?.map((img: any) => ({
                 id: img.id,
                 description: img.description,
@@ -1937,6 +1924,10 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 date: entry.date || entry.created_at,
                 type: entry.type,
                 created_at: entry.created_at,
+                entry_text: entry.entry_text,
+                created_by_user: entry.created_by_user,
+                users: entry.users,
+                uploadedBy: entry.uploadedBy,
               })) || [],
               documents: [],
               images: [],
@@ -2578,18 +2569,25 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           };
 
           try {
-            // Check if this is standalone equipment
-            if (projectId === 'standalone') {
-              await fastAPI.createStandaloneProgressImage(progressImageData);
-            } else {
-              await fastAPI.createProgressImage(progressImageData);
+            // Create in DB and get the new row back (no full refetch)
+            const created = projectId === 'standalone'
+              ? await fastAPI.createStandaloneProgressImage(progressImageData)
+              : await fastAPI.createProgressImage(progressImageData);
+            const newRow = created && (Array.isArray(created) ? created[0] : created);
+            if (newRow) {
+              setLocalEquipment(prev => prev.map(eq =>
+                eq.id === editingEquipmentId
+                  ? {
+                      ...eq,
+                      progressImagesMetadata: [...(eq.progressImagesMetadata || []), newRow],
+                      // progressImages already updated optimistically above with object URL
+                    }
+                  : eq
+              ));
             }
-            // // console.log('✅ Progress image saved to database');
-            
             // Get equipment info for logging
             const currentEquipment = localEquipment.find(eq => eq.id === editingEquipmentId);
             if (currentEquipment) {
-              // Log progress image upload activity
               try {
                 await logProgressImageUploaded(
                   projectId,
@@ -2598,9 +2596,6 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                   currentEquipment.tagNumber || 'Unknown',
                   finalDescription || undefined
                 );
-                // // console.log('✅ Activity logged: Progress image uploaded');
-                
-                // Refresh activity logs if callback provided
                 if (onActivityUpdate) {
                   onActivityUpdate();
                 }
@@ -2608,7 +2603,6 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                 console.error('⚠️ Error logging progress image activity (non-fatal):', logError);
               }
             }
-            
             toast({ title: 'Success', description: 'Progress image uploaded successfully!' });
           } catch (error) {
             console.error('❌ Error saving progress image to database:', error);
@@ -2618,12 +2612,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
 
         reader.readAsDataURL(newProgressImage);
 
-        // Clear progress image state after successful upload
+        // Clear progress image state after upload flow (no full refetch - new image already appended above in onload)
         setNewProgressImage(null);
         setImageDescription('');
-
-        // Refresh equipment data to show the new progress image (immediate for image uploads)
-        await refreshEquipmentData(true);
       } else if (newProgressImage && !imageDescription?.trim()) {
         // Show error if image is selected but description is missing
         toast({ 
@@ -3328,19 +3319,22 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           : entry
       );
     } else {
-      // Add new entry
-      // // console.log('➕ Creating new entry');
+      // Add new entry (include created_by_user and entry_text so UI shows "Uploaded by" and description without refetch)
+      const userName = (user as any)?.full_name || user?.email || localStorage.getItem('userName') || 'Unknown';
       newEntry = {
         id: `progress-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         type: newProgressType,
         comment: newProgressEntry,
+        entry_text: newProgressEntry,
         image: imageBase64,
         imageDescription: imageDescription,
         audio: audioBase64,
         audioDuration: audioDuration,
-        uploadedBy: localStorage.getItem('userName') || 'Unknown',
-        uploadDate: new Date().toISOString()
-      };
+        uploadedBy: userName,
+        uploadDate: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+        created_by_user: { full_name: userName, email: (user as any)?.email || '' },
+      } as ProgressEntry & { created_by_user?: { full_name: string; email: string }; entry_text?: string; created_at?: string };
 
       // // console.log('📝 New entry created:', newEntry);
       newProgressEntries = [...(currentEquipment.progressEntries || []), newEntry];
@@ -3402,26 +3396,24 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
           console.error('⚠️ Error logging activity (non-fatal):', logError);
         }
         
-        // Update the local entry with the real database ID
+        // Update the local entry with the real database ID (no full refetch - append only)
         if (createdEntry && createdEntry[0] && createdEntry[0].id && newEntry) {
-          const realId = createdEntry[0].id;
-          // // console.log('🔄 Updating local entry with real database ID:', realId);
-          
-          // Update the local entry with the real ID
-          setLocalEquipment(prev => {
-            return prev.map(eq => {
-              if (eq.id === equipmentId) {
-                const updatedEntries = eq.progressEntries.map(entry => {
-                  if (entry.id === newEntry!.id) {
-                    return { ...entry, id: realId };
+          const row = createdEntry[0];
+          const realId = row.id;
+          setLocalEquipment(prev =>
+            prev.map(eq =>
+              eq.id === equipmentId
+                ? {
+                    ...eq,
+                    progressEntries: eq.progressEntries.map(entry =>
+                      entry.id === newEntry!.id
+                        ? { ...entry, id: realId, created_at: row.created_at, entry_text: row.entry_text ?? entry.entry_text ?? entry.comment }
+                        : entry
+                    ),
                   }
-                  return entry;
-                });
-                return { ...eq, progressEntries: updatedEntries };
-              }
-              return eq;
-            });
-          });
+                : eq
+            )
+          );
         }
       } else {
         // Update existing progress entry - use appropriate table based on equipment type

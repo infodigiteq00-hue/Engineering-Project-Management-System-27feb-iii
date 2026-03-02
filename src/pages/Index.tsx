@@ -610,12 +610,23 @@ const Index = () => {
     const cacheKey = `${CACHE_KEYS.EQUIPMENT}_standalone`;
     const cachedEquipment = getCache<any[]>(cacheKey);
 
+    // Cache is "stripped" if it has progress metadata/entries but missing display fields (images or created_by_user/entry_text)
+    const isCacheStripped = (list: any[] | null) => {
+      if (!list?.length) return false;
+      const first = list[0];
+      const hasMetaNoImages = (first.progress_images_metadata?.length > 0) && !(first.progress_images?.length > 0);
+      const hasEntriesNoCreator = (first.progress_entries?.length > 0) && first.progress_entries.some(
+        (e: any) => !e.created_by_user && !e.entry_text && !e.text
+      );
+      return hasMetaNoImages || hasEntriesNoCreator;
+    };
+
     const fetchStandaloneEquipment = async () => {
       try {
         setStandaloneEquipmentLoading(true);
 
-        // Valid cache: use it only, no background fetch
-        if (cachedEquipment !== null && Array.isArray(cachedEquipment) && cachedEquipment.length > 0) {
+        // Valid cache: use only if it has full display data (images + entries with created_by_user/entry_text)
+        if (cachedEquipment !== null && Array.isArray(cachedEquipment) && cachedEquipment.length > 0 && !isCacheStripped(cachedEquipment)) {
           const limitedCached = cachedEquipment.slice(0, 24);
           setStandaloneEquipment(limitedCached);
           standaloneDataLoadedRef.current = true;
@@ -628,9 +639,9 @@ const Index = () => {
           return;
         }
 
-        // No valid cache: use expired as fallback display, then fetch when visible
+        // No valid cache (or stripped): use expired only if not stripped, then fetch when visible
         const expiredCache = getCacheEvenIfExpired<any[]>(cacheKey);
-        if (expiredCache !== null && Array.isArray(expiredCache) && expiredCache.length > 0) {
+        if (expiredCache !== null && Array.isArray(expiredCache) && expiredCache.length > 0 && !isCacheStripped(expiredCache)) {
           setStandaloneEquipment(expiredCache.slice(0, 24));
           setStandaloneEquipmentLoading(false);
         }
@@ -640,22 +651,13 @@ const Index = () => {
 
         if (equipment && Array.isArray(equipment) && equipment.length > 0) {
           const first24 = equipment.slice(0, 24);
+          // Keep full progress_images, progress_images_metadata, and progress_entries so UI shows images/entries correctly without extra API calls.
+          // Only strip heavy document blobs; preserve created_by_user and entry_text for "Uploaded by" and description.
           const lightweight = first24.map((eq: any) => ({
             ...eq,
-            progress_images: [],
-            progress_images_metadata: eq.progress_images_metadata?.map((img: any) => ({
-              id: img.id,
-              description: img.description,
-              uploaded_by: img.uploaded_by,
-              upload_date: img.upload_date,
-            })) || [],
-            progress_entries: eq.progress_entries?.map((entry: any) => ({
-              id: entry.id,
-              text: entry.text || entry.entry_text,
-              date: entry.date || entry.created_at,
-              type: entry.type,
-              created_at: entry.created_at,
-            })) || [],
+            progress_images: eq.progress_images ?? [],
+            progress_images_metadata: eq.progress_images_metadata ?? [],
+            progress_entries: eq.progress_entries ?? [],
             documents: [],
             images: [],
           }));
@@ -802,7 +804,7 @@ const Index = () => {
         if (equipment && Array.isArray(equipment) && equipment.length > 0) {
           const lightweight = equipment.map((eq: any) => ({
             ...eq,
-            progress_images: [],
+            progress_images: (eq.progress_images?.length && eq.progress_images[0]) ? [eq.progress_images[0]] : [],
             progress_images_metadata: eq.progress_images_metadata?.map((img: any) => ({
               id: img.id,
               description: img.description,
@@ -815,6 +817,10 @@ const Index = () => {
               date: entry.date || entry.created_at,
               type: entry.type,
               created_at: entry.created_at,
+              entry_text: entry.entry_text,
+              created_by_user: entry.created_by_user,
+              users: entry.users,
+              uploadedBy: entry.uploadedBy,
             })) || [],
             documents: [],
             images: [],

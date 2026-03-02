@@ -29,7 +29,13 @@ export const transformEquipmentData = (dbEquipment: any[]): Equipment[] => {
       images: eq.images || [],
       progressImages: eq.progress_images || [], // Main progress images (top section)
       progressImagesMetadata: eq.progress_images_metadata || [], // Main progress images metadata
-      progressEntries: eq.progress_entries || [], // Progress entries from equipment_progress_entries table (updates tab)
+      // Normalize entries so UI always has entry_text and created_at for display (Updates tab)
+      progressEntries: (eq.progress_entries || []).map((entry: any) => ({
+        ...entry,
+        entry_text: entry.entry_text ?? entry.text ?? entry.comment ?? '',
+        text: entry.text ?? entry.entry_text ?? entry.comment ?? '',
+        created_at: entry.created_at ?? entry.date,
+      })),
       nextMilestone: eq.next_milestone || 'Initial Setup',
       nextMilestoneDate: eq.next_milestone_date,
       commencementDate: eq.commencement_date,

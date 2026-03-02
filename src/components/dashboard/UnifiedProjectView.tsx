@@ -402,7 +402,8 @@ const UnifiedProjectView = ({
   }, [projectId, activeTab, projectData?.id]);
 
   useEffect(() => {
-    if (!projectId || activeTab !== 'equipment-activity') return;
+    // Load when user opens Project Chronology tab (progress-logs) or equipment-activity so Equipment Logs sub-tab has data
+    if (!projectId || (activeTab !== 'progress-logs' && activeTab !== 'equipment-activity')) return;
     if (equipmentLogsLoadedForProjectRef.current === projectId) return;
     loadEquipmentProgressEntries();
   }, [projectId, activeTab, projectData?.id]);
@@ -441,9 +442,9 @@ const UnifiedProjectView = ({
   }, []);
 
   // Auto-refresh equipment activities every 60 seconds (optimized - only when tab is active)
-  // Only refresh when user is actively viewing the Equipment Activity tab
+  // Only refresh when user is actively viewing the Chronology tab (progress-logs or equipment-activity)
   useEffect(() => {
-    if (projectId && activeTab === 'equipment-activity') {
+    if (projectId && (activeTab === 'progress-logs' || activeTab === 'equipment-activity')) {
       const interval = setInterval(() => {
         loadEquipmentProgressEntries();
       }, 60000); // 60 seconds - reduced frequency for better performance

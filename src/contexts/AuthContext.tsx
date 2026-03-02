@@ -89,7 +89,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
 
   useEffect(() => {
     const initializeAuth = async () => {
-      // Restore from localStorage first so logo, name, firmId, and project fetch work on refresh
+      // Restore from localStorage first so logo, name, firmId show immediately (no flash)
       const stored = getInitialStoredAuth();
       if (stored.firmId && stored.userRole) {
         setFirmId(stored.firmId);
@@ -97,7 +97,8 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         setUserName(stored.userName ?? localStorage.getItem('userName'));
         const cachedFirm = getInitialFirmData();
         if (cachedFirm) setFirmData(cachedFirm);
-        setLoading(false);
+        // Do NOT set loading false here. Wait for getSession + fetchUserData so userId/userData
+        // are in localStorage before Index runs project fetch (non-firm_admin need p_user_email).
       }
 
       try {

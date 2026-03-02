@@ -4493,21 +4493,14 @@ export const assignProjectRole = async (data: {
   try {
     // // console.log('🔧 Assigning project role:', data);
     
-    // First create user in users table
-    const userResponse = await axios.post(`${SUPABASE_URL}/rest/v1/users`, {
+    // First create user in users table (use api so JWT is sent for RLS)
+    const userResponse = await api.post('/users', {
       email: data.email,
       full_name: data.full_name,
       role: data.role,
       project_id: data.project_id,
       assigned_by: data.assigned_by,
       is_active: true
-    }, {
-      headers: {
-        'apikey': SUPABASE_ANON_KEY,
-        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-        'Content-Type': 'application/json',
-        'Prefer': 'return=representation'
-      }
     });
 
     // // console.log('✅ Project role assigned successfully:', userResponse.data);
@@ -4529,20 +4522,13 @@ export const assignTeamRole = async (data: {
   try {
     // // console.log('👥 Assigning team role:', data);
     
-    const userResponse = await axios.post(`${SUPABASE_URL}/rest/v1/users`, {
+    const userResponse = await api.post('/users', {
       email: data.email,
       full_name: data.full_name,
       role: data.role,
       project_id: data.project_id,
       assigned_by: data.assigned_by,
       is_active: true
-    }, {
-      headers: {
-        'apikey': SUPABASE_ANON_KEY,
-        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-        'Content-Type': 'application/json',
-        'Prefer': 'return=representation'
-      }
     });
 
     // // console.log('✅ Team role assigned successfully:', userResponse.data);
@@ -4558,14 +4544,10 @@ export const getUsersByProject = async (projectId: string) => {
   try {
     // // console.log('🔍 Fetching users for project:', projectId);
     
-    const response = await axios.get(`${SUPABASE_URL}/rest/v1/users`, {
+    const response = await api.get('/users', {
       params: {
         project_id: `eq.${projectId}`,
         select: 'id,email,full_name,role,assigned_by,created_at'
-      },
-      headers: {
-        'apikey': SUPABASE_ANON_KEY,
-        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
       }
     });
 
@@ -4582,15 +4564,11 @@ export const getUsersByFirm = async (firmId: string) => {
   try {
     // // console.log('🏢 Fetching users for firm:', firmId);
     
-    const response = await axios.get(`${SUPABASE_URL}/rest/v1/users`, {
+    const response = await api.get('/users', {
       params: {
         firm_id: `eq.${firmId}`,
         project_id: `is.null`,
         select: 'id,email,full_name,role,assigned_by,created_at'
-      },
-      headers: {
-        'apikey': SUPABASE_ANON_KEY,
-        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
       }
     });
 
@@ -4607,19 +4585,7 @@ export const updateUserRole = async (userId: string, newRole: string) => {
   try {
     // // console.log('🔄 Updating user role:', { userId, newRole });
     
-    const response = await axios.patch(`${SUPABASE_URL}/rest/v1/users`, {
-      role: newRole
-    }, {
-      params: {
-        id: `eq.${userId}`
-      },
-      headers: {
-        'apikey': SUPABASE_ANON_KEY,
-        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-        'Content-Type': 'application/json',
-        'Prefer': 'return=representation'
-      }
-    });
+    const response = await api.patch(`/users?id=eq.${userId}`, { role: newRole });
 
     // // console.log('✅ User role updated successfully:', response.data);
     return response.data;
@@ -4634,15 +4600,7 @@ export const deleteUser = async (userId: string) => {
   try {
     // // console.log('🗑️ Deleting user:', userId);
     
-    const response = await axios.delete(`${SUPABASE_URL}/rest/v1/users`, {
-      params: {
-        id: `eq.${userId}`
-      },
-      headers: {
-        'apikey': SUPABASE_ANON_KEY,
-        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
-      }
-    });
+    const response = await api.delete(`/users?id=eq.${userId}`);
 
     // // console.log('✅ User deleted successfully');
     return response.data;
@@ -5310,15 +5268,11 @@ export const getProjectDocuments = async (projectId: string) => {
   try {
     // // console.log('📄 Fetching documents for project:', projectId);
     
-    const response = await axios.get(`${SUPABASE_URL}/rest/v1/project_documents`, {
+    const response = await api.get('/project_documents', {
       params: {
         project_id: `eq.${projectId}`,
         select: '*',
         order: 'created_at.desc'
-      },
-      headers: {
-        'apikey': SUPABASE_ANON_KEY,
-        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
       }
     });
 
@@ -5335,15 +5289,7 @@ export const deleteDocument = async (documentId: string) => {
   try {
     // // console.log('🗑️ Deleting document:', documentId);
     
-    const response = await axios.delete(`${SUPABASE_URL}/rest/v1/project_documents`, {
-      params: {
-        id: `eq.${documentId}`
-      },
-      headers: {
-        'apikey': SUPABASE_ANON_KEY,
-        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
-      }
-    });
+    const response = await api.delete(`/project_documents?id=eq.${documentId}`);
 
     // // console.log('✅ Document deleted successfully');
     return response.data;
@@ -5358,14 +5304,10 @@ export const getDocumentById = async (documentId: string) => {
   try {
     // // console.log('📄 Fetching document by ID:', documentId);
     
-    const response = await axios.get(`${SUPABASE_URL}/rest/v1/project_documents`, {
+    const response = await api.get('/project_documents', {
       params: {
         id: `eq.${documentId}`,
         select: '*'
-      },
-      headers: {
-        'apikey': SUPABASE_ANON_KEY,
-        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
       }
     });
 
@@ -5385,17 +5327,7 @@ export const updateProjectDocumentLinks = async (projectId: string, documentType
     const updateData: any = {};
     updateData[documentType] = documentLinks;
     
-    const response = await axios.patch(`${SUPABASE_URL}/rest/v1/projects`, updateData, {
-      params: {
-        id: `eq.${projectId}`
-      },
-      headers: {
-        'apikey': SUPABASE_ANON_KEY,
-        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-        'Content-Type': 'application/json',
-        'Prefer': 'return=representation'
-      }
-    });
+    const response = await api.patch(`/projects?id=eq.${projectId}`, updateData);
 
     // // console.log('✅ Project document links updated successfully:', response.data);
     return response.data;
@@ -5458,14 +5390,10 @@ export const getProjectDocumentLinks = async (projectId: string) => {
   try {
     // // console.log('📄 Fetching project document links for project:', projectId);
     
-    const response = await axios.get(`${SUPABASE_URL}/rest/v1/projects`, {
+    const response = await api.get('/projects', {
       params: {
         id: `eq.${projectId}`,
         select: 'unpriced_po_documents,design_inputs_documents,client_reference_documents,other_documents'
-      },
-      headers: {
-        'apikey': SUPABASE_ANON_KEY,
-        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
       }
     });
 
