@@ -732,13 +732,12 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
         }
         return true;
       })
+      // Fixed sequence: first created = first in list; updates/adds/deletes inside equipment do not change order
       .sort((a, b) => {
-        if (a.lastUpdate && b.lastUpdate) {
-          const dateA = new Date(a.lastUpdate).getTime();
-          const dateB = new Date(b.lastUpdate).getTime();
-          return dateB - dateA;
-        }
-        return b.id.localeCompare(a.id);
+        const createdA = (a as { created_at?: string }).created_at ? new Date((a as { created_at?: string }).created_at).getTime() : 0;
+        const createdB = (b as { created_at?: string }).created_at ? new Date((b as { created_at?: string }).created_at).getTime() : 0;
+        if (createdA !== createdB) return createdA - createdB; // ascending: oldest first
+        return a.id.localeCompare(b.id); // stable tiebreaker
       });
   }, []);
 
@@ -1956,6 +1955,7 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
   const [documentUrlModal, setDocumentUrlModal] = useState<{ url?: string, blobUrl?: string, name: string, uploadedBy?: string, uploadDate?: string, loading?: boolean, previewLoading?: boolean, documentId?: string } | null>(null);
   const [loadingStates, setLoadingStates] = useState<Record<string, boolean>>({});
   const [documentsLoading, setDocumentsLoading] = useState<Record<string, boolean>>({});
+  const [docsSearchByEquipmentId, setDocsSearchByEquipmentId] = useState<Record<string, string>>({});
 
   // Fetch equipment documents metadata only (no document_url) - document URL loaded on-demand when user clicks View
   const fetchEquipmentDocuments = async (equipmentId: string) => {
@@ -4724,8 +4724,9 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               }
             });
 
-            // Create the equipment
-            const createdEquipmentResponse = await fastAPI.createStandaloneEquipment(equipmentData);
+            // Create the equipment (pass firmId for max equipment limit check)
+            const firmId = localStorage.getItem('firmId');
+            const createdEquipmentResponse = await fastAPI.createStandaloneEquipment(equipmentData, firmId || undefined);
             const createdEquipment = Array.isArray(createdEquipmentResponse) ? createdEquipmentResponse[0] : createdEquipmentResponse;
             const equipmentId = createdEquipment?.id;
             
@@ -5344,9 +5345,10 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
       // });
 
       // Call appropriate API based on equipment type
-      // Standalone equipment uses createStandaloneEquipment, project equipment uses createEquipment
+      // Standalone equipment uses createStandaloneEquipment, project equipment uses createEquipment (pass firmId for limit check)
+      const firmId = localStorage.getItem('firmId');
       const createdEquipment = isStandalone 
-        ? await fastAPI.createStandaloneEquipment(equipmentData)
+        ? await fastAPI.createStandaloneEquipment(equipmentData, firmId || undefined)
         : await fastAPI.createEquipment(equipmentData);
       // // console.log('✅ Equipment created successfully:', createdEquipment);
 
@@ -8629,14 +8631,11 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
               return true;
             })
             .sort((a, b) => {
-              // Sort by lastUpdate date (descending - latest first)
-              if (a.lastUpdate && b.lastUpdate) {
-                const dateA = new Date(a.lastUpdate);
-                const dateB = new Date(b.lastUpdate);
-                return dateB.getTime() - dateA.getTime();
-              }
-              // If no lastUpdate, sort by ID (newer IDs first)
-              return b.id.localeCompare(a.id);
+              // Fixed sequence: first created = first in list (updates/adds/deletes inside equipment do not change order)
+              const createdA = (a as { created_at?: string }).created_at ? new Date((a as { created_at?: string }).created_at).getTime() : 0;
+              const createdB = (b as { created_at?: string }).created_at ? new Date((b as { created_at?: string }).created_at).getTime() : 0;
+              if (createdA !== createdB) return createdA - createdB; // ascending: oldest first
+              return a.id.localeCompare(b.id); // stable tiebreaker
                 });
               
               // Pagination: Calculate total pages and slice data
@@ -11175,6 +11174,16 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                                 </Button>
                               )}
                             </div>
+                            <div className="relative mb-2">
+                              <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400" />
+                              <input
+                                type="text"
+                                placeholder="Search documents..."
+                                value={docsSearchByEquipmentId[item.id] ?? ''}
+                                onChange={(e) => setDocsSearchByEquipmentId(prev => ({ ...prev, [item.id]: e.target.value }))}
+                                className="w-full pl-8 pr-3 py-1.5 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                              />
+                            </div>
                             <div className="max-h-[200px] sm:h-36 overflow-y-auto border border-gray-200 rounded bg-gray-50 p-2 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
                               {(() => {
                                 // // console.log('📄 PERFECT: Rendering documents for equipment:', item.id);
@@ -11196,6 +11205,13 @@ const EquipmentGrid = ({ equipment, projectName, projectId, onBack, onViewDetail
                                     // Filter out Core Documents - they should only appear in Details tab
                                     const coreDocumentTypes = ['Unpriced PO File', 'Design Inputs PID', 'Client Reference Doc', 'Other Documents'];
                                     return !coreDocumentTypes.includes(doc.document_type || '');
+                                  })
+                                  .filter((doc) => {
+                                    const q = (docsSearchByEquipmentId[item.id] ?? '').trim().toLowerCase();
+                                    if (!q) return true;
+                                    const name = (doc.document_name || doc.name || '').toLowerCase();
+                                    const type = ((doc as { document_type?: string }).document_type || '').toLowerCase();
+                                    return name.includes(q) || type.includes(q);
                                   })
                                   .map((doc) => {
                                   const getDocumentCategory = (fileName: string) => {

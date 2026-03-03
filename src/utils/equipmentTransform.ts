@@ -26,6 +26,7 @@ export const transformEquipmentData = (dbEquipment: any[]): Equipment[] => {
       lastUpdate: eq.last_update || (eq.updated_at ? new Date(eq.updated_at).toLocaleDateString() : new Date().toLocaleDateString()),
       last_update: eq.last_update || undefined, // Store raw date (DATE type) for standalone equipment
       updated_at: eq.updated_at || undefined, // Store raw timestamp for date inputs
+      created_at: eq.created_at || undefined, // Store for fixed display order (first created = first in list)
       images: eq.images || [],
       progressImages: eq.progress_images || [], // Main progress images (top section)
       progressImagesMetadata: eq.progress_images_metadata || [], // Main progress images metadata

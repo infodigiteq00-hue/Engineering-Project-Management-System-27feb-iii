@@ -51,6 +51,7 @@ export interface Equipment {
   supervisor: string;
   lastUpdate: string;
   updated_at?: string; // Raw database timestamp for date inputs
+  created_at?: string; // Raw database timestamp for fixed display order (first created = first in list)
   images: string[];
   progressImages: string[]; // Legacy field - will be removed
   progressImagesMetadata?: Array<{

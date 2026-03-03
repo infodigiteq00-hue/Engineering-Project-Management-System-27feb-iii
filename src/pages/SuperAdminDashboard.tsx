@@ -27,6 +27,14 @@ import {
 } from "lucide-react";
 import { useNavigate } from 'react-router-dom';
 
+export interface FirmAdminEntry {
+  id?: string;
+  full_name: string;
+  email: string;
+  phone?: string;
+  whatsapp?: string;
+}
+
 interface Company {
   id: string;
   name: string;
@@ -42,6 +50,9 @@ interface Company {
   logo_url?: string | null;
   services_paused?: boolean;
   equipment_unlock_days?: number | null;
+  firm_admins?: FirmAdminEntry[];
+  max_equipment_limit?: number | null;
+  equipment_count?: number;
 }
 
 interface User {
@@ -156,7 +167,9 @@ const SuperAdminDashboard = () => {
     admin_email: '',
     admin_phone: '',
     admin_whatsapp: '',
-    equipment_unlock_days: 90
+    equipment_unlock_days: 90,
+    firm_admins: [{ full_name: '', email: '', phone: '', whatsapp: '' }] as FirmAdminEntry[],
+    max_equipment_limit: null as number | null
   });
   const [newCompanyLogo, setNewCompanyLogo] = useState<File | null>(null);
   const [newCompanyLogoPreview, setNewCompanyLogoPreview] = useState<string | null>(null);
@@ -179,14 +192,58 @@ const SuperAdminDashboard = () => {
         fastAPI.getUsers()
       ]);
 
-      // Process companies with user count and admin info
+      // Process companies with user count and all firm admins
       const processedCompanies = companiesData?.map((company: any) => {
         const companyUsers = usersData?.filter((user: any) => user.firm_id === company.id) || [];
-        const adminUser = companyUsers.find((user: any) => user.role === 'firm_admin');
+        const adminUsers = companyUsers.filter((user: any) => user.role === 'firm_admin');
 
-        // If admin exists in users table, use that data, otherwise use company data
-        const adminName = adminUser?.full_name || company.admin_name || '';
-        const adminEmail = adminUser?.email || company.admin_email || '';
+        // Prefer firm_admins from firms table (all stored; no overwrite); merge with users to get id
+        const storedFirmAdmins = Array.isArray(company.firm_admins) ? company.firm_admins : null;
+        let firm_admins: FirmAdminEntry[];
+        if (storedFirmAdmins && storedFirmAdmins.length > 0) {
+          const byEmail = new Map(adminUsers.map((u: any) => [((u.email || '') as string).toLowerCase(), u]));
+          firm_admins = storedFirmAdmins.map((a: any) => {
+            const user = a.email ? byEmail.get((a.email as string).toLowerCase()) : null;
+            return {
+              id: user?.id ?? a.id,
+              full_name: (a.full_name ?? user?.full_name ?? '') || '',
+              email: (a.email ?? user?.email ?? '') || '',
+              phone: (a.phone ?? user?.phone ?? '') ?? '',
+              whatsapp: (a.whatsapp ?? user?.whatsapp ?? '') ?? ''
+            };
+          });
+          // Append any admin users not in stored list (e.g. just invited, not yet in firm_admins)
+          const storedEmails = new Set(firm_admins.map((a) => (a.email || '').toLowerCase()));
+          for (const u of adminUsers) {
+            if (!u.email || storedEmails.has((u.email as string).toLowerCase())) continue;
+            storedEmails.add((u.email as string).toLowerCase());
+            firm_admins.push({
+              id: u.id,
+              full_name: u.full_name || '',
+              email: u.email || '',
+              phone: u.phone || '',
+              whatsapp: (u.whatsapp ?? (company.admin_whatsapp && u.id === adminUsers[0]?.id ? company.admin_whatsapp : '')) || ''
+            });
+          }
+        } else {
+          const firstAdmin = adminUsers[0];
+          firm_admins = adminUsers.length > 0
+            ? adminUsers.map((u: any) => ({
+                id: u.id,
+                full_name: u.full_name || '',
+                email: u.email || '',
+                phone: u.phone || '',
+                whatsapp: (u.whatsapp ?? (company.admin_whatsapp && u.id === firstAdmin?.id ? company.admin_whatsapp : '')) || ''
+              }))
+            : (company.admin_name || company.admin_email
+                ? [{ full_name: company.admin_name || '', email: company.admin_email || '', phone: company.admin_phone || '', whatsapp: company.admin_whatsapp || '' }]
+                : []);
+        }
+
+        const firstAdmin = firm_admins[0];
+        // First admin / legacy fields for backward compat
+        const adminName = firstAdmin?.full_name || company.admin_name || '';
+        const adminEmail = firstAdmin?.email || company.admin_email || '';
 
         return {
           id: company.id,
@@ -198,15 +255,20 @@ const SuperAdminDashboard = () => {
           user_count: companyUsers.length,
           admin_name: adminName,
           admin_email: adminEmail,
-          admin_phone: company.admin_phone || '',
+          admin_phone: firstAdmin?.phone || company.admin_phone || '',
           admin_whatsapp: company.admin_whatsapp || '',
           logo_url: company.logo_url || null,
           services_paused: company.services_paused ?? false,
-          equipment_unlock_days: company.equipment_unlock_days ?? 90
+          equipment_unlock_days: company.equipment_unlock_days ?? 90,
+          firm_admins,
+          max_equipment_limit: company.max_equipment_limit ?? null
         };
       }) || [];
 
-      setCompanies(processedCompanies);
+      const counts = await Promise.all(processedCompanies.map((c) => fastAPI.getEquipmentCountByFirm(c.id)));
+      const withCounts = processedCompanies.map((c, i) => ({ ...c, equipment_count: counts[i] ?? 0 }));
+
+      setCompanies(withCounts);
       setUsers(usersData || []);
 
       // Data processed successfully
@@ -220,17 +282,35 @@ const SuperAdminDashboard = () => {
   const handleCreateCompany = async () => {
     try {
       setCreatingCompany(true);
-      // Create company in firms table
+      const firstAdmin = newCompany.firm_admins?.[0];
+      const adminName = firstAdmin?.full_name ?? newCompany.admin_name;
+      const adminEmail = firstAdmin?.email ?? newCompany.admin_email;
+      const adminPhone = firstAdmin?.phone ?? newCompany.admin_phone;
+      const adminWhatsapp = firstAdmin?.whatsapp ?? newCompany.admin_whatsapp;
+
+      // Build firm_admins array for firms table (all admins; no overwrite)
+      const firmAdminsPayload = (newCompany.firm_admins || [])
+        .filter((a) => (a.email || '').trim())
+        .map((a) => ({
+          full_name: (a.full_name || '').trim() || (a.email || '').trim(),
+          email: (a.email || '').trim(),
+          phone: (a.phone || '').trim() || undefined,
+          whatsapp: (a.whatsapp || '').trim() || undefined
+        }));
+
+      // Create company in firms table (first admin for legacy fields + full firm_admins array)
       const companyData = await fastAPI.createCompany({
         name: newCompany.name,
         subscription_plan: newCompany.subscription_plan,
         is_active: newCompany.is_active,
         max_users: newCompany.max_users,
-        admin_name: newCompany.admin_name,
-        admin_email: newCompany.admin_email,
-        admin_phone: newCompany.admin_phone,
-        admin_whatsapp: newCompany.admin_whatsapp,
-        equipment_unlock_days: newCompany.equipment_unlock_days ?? 90
+        admin_name: adminName,
+        admin_email: adminEmail,
+        admin_phone: adminPhone,
+        admin_whatsapp: adminWhatsapp,
+        equipment_unlock_days: newCompany.equipment_unlock_days ?? 90,
+        firm_admins: firmAdminsPayload.length ? firmAdminsPayload : undefined,
+        max_equipment_limit: newCompany.max_equipment_limit ?? null
       });
 
       // // console.log('✅ Company created:', companyData);
@@ -290,44 +370,37 @@ const SuperAdminDashboard = () => {
         return;
       }
 
-      // 🆕 Create invite for firm admin
-      try {
-        // // console.log('📧 Creating invite for firm admin...');
-        await fastAPI.createInvite({
-          email: newCompany.admin_email,
-          full_name: newCompany.admin_name,
-          role: 'firm_admin',
-          firm_id: firmId,
-          invited_by: user.id
-        });
-        // // console.log('✅ Invite created for firm admin');
-      } catch (inviteError) {
-        console.error('❌ Error creating invite (company still created):', inviteError);
-        // Don't fail the whole operation if invite creation fails
+      // Create invite for each firm admin
+      const adminsToInvite = (newCompany.firm_admins || []).filter((a) => (a.email || '').trim());
+      for (const admin of adminsToInvite) {
+        try {
+          await fastAPI.createInvite({
+            email: admin.email.trim(),
+            full_name: (admin.full_name || '').trim() || admin.email.trim(),
+            role: 'firm_admin',
+            firm_id: firmId,
+            invited_by: user.id
+          });
+        } catch (inviteError) {
+          console.error('❌ Error creating invite for', admin.email, '(company still created):', inviteError);
+        }
       }
 
-      // Send notifications to admin
-      try {
-        // // console.log('📧 Sending notifications to admin...');
-        const notificationResult = await sendNotifications({
-          company_name: newCompany.name,
-          admin_name: newCompany.admin_name,
-          admin_email: newCompany.admin_email,
-          admin_phone: newCompany.admin_phone,
-          admin_whatsapp: newCompany.admin_whatsapp,
-          role: 'firm_admin',
-          dashboard_url: getDashboardUrl('firm_admin')
-        });
-
-        // // console.log('📊 Notification result:', notificationResult);
-
-        if (notificationResult.success) {
-          // console.log('✅ Notifications sent successfully');
-        } else {
-          // console.log('⚠️ Some notifications failed, but company was created');
+      // Send notifications to each firm admin
+      for (const admin of adminsToInvite) {
+        try {
+          await sendNotifications({
+            company_name: newCompany.name,
+            admin_name: (admin.full_name || '').trim() || admin.email,
+            admin_email: admin.email.trim(),
+            admin_phone: admin.phone || '',
+            admin_whatsapp: admin.whatsapp || '',
+            role: 'firm_admin',
+            dashboard_url: getDashboardUrl('firm_admin')
+          });
+        } catch (notificationError) {
+          console.error('❌ Notification error for', admin.email, '(company still created):', notificationError);
         }
-      } catch (notificationError) {
-        console.error('❌ Notification error (company still created):', notificationError);
       }
 
       // Reset form and refresh data
@@ -340,7 +413,9 @@ const SuperAdminDashboard = () => {
         admin_email: '',
         admin_phone: '',
         admin_whatsapp: '',
-        equipment_unlock_days: 90
+        equipment_unlock_days: 90,
+        firm_admins: [{ full_name: '', email: '', phone: '', whatsapp: '' }],
+        max_equipment_limit: null
       });
       setNewCompanyLogo(null);
       setNewCompanyLogoPreview(null);
@@ -413,20 +488,40 @@ const SuperAdminDashboard = () => {
         }
       }
 
-      // Update company in firms table - this should always complete
+      // First firm admin for legacy firm fields; full list for firm_admins (no overwrite)
+      const firstAdmin = editingCompany.firm_admins?.[0];
+      const admin_name = firstAdmin?.full_name ?? editingCompany.admin_name ?? '';
+      const admin_email = firstAdmin?.email ?? editingCompany.admin_email ?? '';
+      const admin_phone = firstAdmin?.phone ?? editingCompany.admin_phone ?? '';
+      const admin_whatsapp = firstAdmin?.whatsapp ?? editingCompany.admin_whatsapp ?? '';
+
+      const firmAdminsList = editingCompany.firm_admins ?? (editingCompany.admin_name || editingCompany.admin_email ? [{ full_name: editingCompany.admin_name ?? '', email: editingCompany.admin_email ?? '', phone: editingCompany.admin_phone ?? '', whatsapp: editingCompany.admin_whatsapp ?? '' }] : []);
+      const firmAdminsPayload = firmAdminsList
+        .filter((a) => (a.email || '').trim())
+        .map((a) => ({
+          ...(a.id && { id: a.id }),
+          full_name: (a.full_name || '').trim() || (a.email || '').trim(),
+          email: (a.email || '').trim(),
+          phone: (a.phone || '').trim() || undefined,
+          whatsapp: (a.whatsapp || '').trim() || undefined
+        }));
+
+      // Update company in firms table - this should always complete (all firm admins stored in firm_admins)
       // console.log('💾 Updating company data...');
       const updateData = {
         name: editingCompany.name,
         subscription_plan: editingCompany.subscription_plan,
         is_active: editingCompany.is_active,
         max_users: editingCompany.max_users,
-        admin_name: editingCompany.admin_name,
-        admin_email: editingCompany.admin_email,
-        admin_phone: editingCompany.admin_phone,
-        admin_whatsapp: editingCompany.admin_whatsapp,
+        admin_name,
+        admin_email,
+        admin_phone,
+        admin_whatsapp,
         logo_url: logoUrl,
         equipment_unlock_days: editingCompany.equipment_unlock_days ?? 90,
-        updated_at: new Date().toISOString()
+        updated_at: new Date().toISOString(),
+        firm_admins: firmAdminsPayload,
+        max_equipment_limit: editingCompany.max_equipment_limit ?? null
       };
       
       try {
@@ -437,21 +532,33 @@ const SuperAdminDashboard = () => {
         throw new Error(updateError?.response?.data?.message || updateError?.message || 'Failed to update company data');
       }
 
-      // Update admin user if name or email changed (non-critical)
-      if (editingCompany.admin_name || editingCompany.admin_email) {
-        try {
-          // console.log('👤 Updating admin user...');
-          const adminUser = users.find(user => user.firm_id === editingCompany.id && user.role === 'firm_admin');
-          if (adminUser) {
-            await fastAPI.updateUser(adminUser.id, {
-              full_name: editingCompany.admin_name,
-              email: editingCompany.admin_email
+      // Update each existing firm admin user; create invite for new (no id) entries
+      for (const admin of firmAdminsList) {
+        const email = (admin.email || '').trim();
+        if (!email) continue;
+        if (admin.id) {
+          try {
+            await fastAPI.updateUser(admin.id, {
+              full_name: (admin.full_name || '').trim() || email,
+              email,
+              ...(admin.phone !== undefined && { phone: admin.phone || null }),
+              ...(admin.whatsapp !== undefined && { whatsapp: admin.whatsapp || null })
             });
-            // console.log('✅ Admin user updated successfully');
+          } catch (userError) {
+            console.error('⚠️ Error updating firm admin user (non-critical):', userError);
           }
-        } catch (userError) {
-          console.error('⚠️ Error updating admin user (non-critical):', userError);
-          // Don't fail the whole operation if user update fails
+        } else {
+          try {
+            await fastAPI.createInvite({
+              email,
+              full_name: (admin.full_name || '').trim() || email,
+              role: 'firm_admin',
+              firm_id: editingCompany.id,
+              invited_by: user.id
+            });
+          } catch (inviteError) {
+            console.error('⚠️ Error creating invite for new firm admin (non-critical):', inviteError);
+          }
         }
       }
 
@@ -795,22 +902,52 @@ const SuperAdminDashboard = () => {
                     </div>
 
                     <div className="flex items-center justify-between">
+                      <span className="text-sm text-gray-600">Equipment:</span>
+                      <span className="text-sm text-gray-900">
+                        {company.equipment_count ?? 0}
+                        {company.max_equipment_limit != null ? ` / ${company.max_equipment_limit}` : ' (unlimited)'}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center justify-between">
                       <span className="text-sm text-gray-600">Onboarded on:</span>
                       <span className="text-sm text-gray-900">{formatDate(company.created_at)}</span>
                     </div>
                   </div>
 
-                  {/* Company Admin Section */}
+                  {/* Company Admins Section (multiple firm admins) - fixed height, hidden vertical scroll */}
                   <div className="mt-4 pt-4 border-t">
                     <div className="flex items-center gap-2 mb-3">
                       <User className="w-4 h-4 text-gray-600" />
-                      <span className="text-sm font-medium text-gray-700 font-sans">Company Admin</span>
+                      <span className="text-sm font-medium text-gray-700 font-sans">Company Admins</span>
                     </div>
 
-                    <div className="space-y-2">
-                      {company.admin_name ? (
+                    <div
+                      className="space-y-2 min-h-[72px] max-h-[72px] overflow-y-auto overflow-x-hidden [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+                      style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
+                    >
+                      {(company.firm_admins && company.firm_admins.length > 0) ? (
                         <>
-                          <div className="flex items-center gap-3">
+                          {company.firm_admins.map((admin, i) => (
+                            <div key={admin.id ?? i} className="flex items-center gap-3 flex-shrink-0">
+                              <div className="w-8 h-8 bg-blue-100 rounded-full flex items-center justify-center text-blue-600 text-sm font-medium flex-shrink-0">
+                                {(admin.full_name || admin.email) ? (admin.full_name || admin.email).charAt(0).toUpperCase() : 'A'}
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <p className="text-sm font-medium text-gray-900 font-display truncate">{admin.full_name || admin.email || '—'}</p>
+                                <p className="text-xs text-gray-500 font-sans truncate">{admin.email || '—'}</p>
+                                {(admin.phone || admin.whatsapp) && (
+                                  <p className="text-xs text-gray-500 mt-0.5">
+                                    {[admin.phone, admin.whatsapp].filter(Boolean).join(' · ')}
+                                  </p>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+                        </>
+                      ) : company.admin_name || company.admin_email ? (
+                        <>
+                          <div className="flex items-center gap-3 flex-shrink-0">
                             <div className="w-8 h-8 bg-blue-100 rounded-full flex items-center justify-center text-blue-600 text-sm font-medium">
                               {company.admin_name ? company.admin_name.charAt(0).toUpperCase() : 'A'}
                             </div>
@@ -819,30 +956,29 @@ const SuperAdminDashboard = () => {
                               <p className="text-xs text-gray-500 font-sans">{company.admin_email}</p>
                             </div>
                           </div>
+                          <div className="flex items-center justify-between flex-shrink-0">
+                            <span className="text-sm text-gray-600">Phone:</span>
+                            <span className="text-sm text-gray-900">{company.admin_phone || 'Not provided'}</span>
+                          </div>
+                          <div className="flex items-center justify-between flex-shrink-0">
+                            <span className="text-sm text-gray-600">WhatsApp:</span>
+                            <span className="text-sm text-gray-900">{company.admin_whatsapp || 'Not provided'}</span>
+                          </div>
                         </>
                       ) : (
-                        <div className="text-center py-2">
+                        <div className="text-center py-2 flex-shrink-0">
                           <p className="text-sm text-gray-500">No admin user found</p>
                           <p className="text-xs text-gray-400">Admin will be created when company is set up</p>
                         </div>
                       )}
-
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm text-gray-600">Phone:</span>
-                        <span className="text-sm text-gray-900">{company.admin_phone || 'Not provided'}</span>
-                      </div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm text-gray-600">WhatsApp:</span>
-                        <span className="text-sm text-gray-900">{company.admin_whatsapp || 'Not provided'}</span>
-                      </div>
                     </div>
 
                     {/* Stats */}
                     <div className="mt-4 pt-4 border-t border-gray-200 bg-gray-50 -mx-4 -mb-4 px-4 py-3 rounded-b-lg">
                       <div className="flex justify-between text-sm text-gray-700">
                         <span>{company.user_count}/{company.max_users || 5} Users</span>
-                        <span>{company.admin_name ? '1' : '0'} Admins</span>
-                        <span>{Math.max(0, company.user_count - (company.admin_name ? 1 : 0))} Members</span>
+                        <span>{(company.firm_admins?.length ?? (company.admin_name || company.admin_email ? 1 : 0))} Admins</span>
+                        <span>{Math.max(0, company.user_count - (company.firm_admins?.length ?? (company.admin_name || company.admin_email ? 1 : 0)))} Members</span>
                       </div>
                     </div>
                   </div>
@@ -909,48 +1045,89 @@ const SuperAdminDashboard = () => {
                 />
               </div>
 
+              {/* Firm Admins (multiple) */}
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Admin Name</label>
-                <input
-                  type="text"
-                  value={newCompany.admin_name}
-                  onChange={(e) => setNewCompany(prev => ({ ...prev, admin_name: e.target.value }))}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  placeholder="Enter admin name"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Admin Email</label>
-                <input
-                  type="email"
-                  value={newCompany.admin_email}
-                  onChange={(e) => setNewCompany(prev => ({ ...prev, admin_email: e.target.value }))}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  placeholder="Enter admin email"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Admin Phone (Optional)</label>
-                <input
-                  type="tel"
-                  value={newCompany.admin_phone}
-                  onChange={(e) => setNewCompany(prev => ({ ...prev, admin_phone: e.target.value }))}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  placeholder="Enter admin phone"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Admin WhatsApp (Optional)</label>
-                <input
-                  type="tel"
-                  value={newCompany.admin_whatsapp}
-                  onChange={(e) => setNewCompany(prev => ({ ...prev, admin_whatsapp: e.target.value }))}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  placeholder="Enter admin WhatsApp"
-                />
+                <div className="flex items-center justify-between mb-2">
+                  <label className="block text-sm font-medium text-gray-700">Firm Admins</label>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setNewCompany(prev => ({
+                      ...prev,
+                      firm_admins: [...(prev.firm_admins || []), { full_name: '', email: '', phone: '', whatsapp: '' }]
+                    }))}
+                  >
+                    <Plus className="w-4 h-4 mr-1" />
+                    Add firm admin
+                  </Button>
+                </div>
+                {(newCompany.firm_admins || []).map((admin, idx) => (
+                  <div key={idx} className="mb-4 p-3 border border-gray-200 rounded-md bg-gray-50/50 space-y-2">
+                    <div className="flex justify-between items-center mb-2">
+                      <span className="text-xs font-medium text-gray-600">Firm admin {idx + 1}</span>
+                      {(newCompany.firm_admins?.length ?? 0) > 1 && (
+                        <button
+                          type="button"
+                          onClick={() => setNewCompany(prev => ({
+                            ...prev,
+                            firm_admins: prev.firm_admins?.filter((_, i) => i !== idx) ?? []
+                          }))}
+                          className="text-red-600 hover:text-red-800 p-1"
+                          aria-label="Remove firm admin"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
+                    <div>
+                      <input
+                        type="text"
+                        value={admin.full_name}
+                        onChange={(e) => setNewCompany(prev => ({
+                          ...prev,
+                          firm_admins: (prev.firm_admins || []).map((a, i) => i === idx ? { ...a, full_name: e.target.value } : a)
+                        }))}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                        placeholder="Name"
+                      />
+                    </div>
+                    <div>
+                      <input
+                        type="email"
+                        value={admin.email}
+                        onChange={(e) => setNewCompany(prev => ({
+                          ...prev,
+                          firm_admins: (prev.firm_admins || []).map((a, i) => i === idx ? { ...a, email: e.target.value } : a)
+                        }))}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                        placeholder="Email *"
+                      />
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        type="tel"
+                        value={admin.phone || ''}
+                        onChange={(e) => setNewCompany(prev => ({
+                          ...prev,
+                          firm_admins: (prev.firm_admins || []).map((a, i) => i === idx ? { ...a, phone: e.target.value } : a)
+                        }))}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                        placeholder="Phone"
+                      />
+                      <input
+                        type="tel"
+                        value={admin.whatsapp || ''}
+                        onChange={(e) => setNewCompany(prev => ({
+                          ...prev,
+                          firm_admins: (prev.firm_admins || []).map((a, i) => i === idx ? { ...a, whatsapp: e.target.value } : a)
+                        }))}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                        placeholder="WhatsApp"
+                      />
+                    </div>
+                  </div>
+                ))}
               </div>
 
               <div>
@@ -969,6 +1146,23 @@ const SuperAdminDashboard = () => {
                   placeholder="e.g. 60 or 90"
                 />
                 <p className="text-xs text-gray-500 mt-1">Equipment tab stays locked for this many days after onboarding so users get used to the app step by step.</p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Max equipment limit (optional)</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={newCompany.max_equipment_limit ?? ''}
+                  onChange={(e) => {
+                    const v = e.target.value === '' ? null : parseInt(e.target.value, 10);
+                    const num = v === null ? null : (isNaN(v as number) ? 0 : Math.max(0, v as number));
+                    setNewCompany(prev => ({ ...prev, max_equipment_limit: num }));
+                  }}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  placeholder="Unlimited if empty"
+                />
+                <p className="text-xs text-gray-500 mt-1">Total equipment (project + standalone) this company can create. Leave empty for unlimited.</p>
               </div>
 
               {/* Company Logo Upload */}
@@ -1054,7 +1248,7 @@ const SuperAdminDashboard = () => {
               <Button
                 onClick={handleCreateCompany}
                 className="bg-blue-600 hover:bg-blue-700 text-white flex-1"
-                disabled={!newCompany.name || !newCompany.admin_name || !newCompany.admin_email || creatingCompany}
+                disabled={!newCompany.name || !(newCompany.firm_admins?.some(a => (a.email || '').trim())) || creatingCompany}
               >
                 {creatingCompany ? (
                   <>
@@ -1132,44 +1326,89 @@ const SuperAdminDashboard = () => {
                 />
               </div>
 
+              {/* Firm Admins (multiple) - pre-filled from company */}
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Admin Name</label>
-                <input
-                  type="text"
-                  value={editingCompany.admin_name || ''}
-                  onChange={(e) => setEditingCompany(prev => prev ? { ...prev, admin_name: e.target.value } : null)}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Admin Email</label>
-                <input
-                  type="email"
-                  value={editingCompany.admin_email || ''}
-                  onChange={(e) => setEditingCompany(prev => prev ? { ...prev, admin_email: e.target.value } : null)}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Admin Phone</label>
-                <input
-                  type="tel"
-                  value={editingCompany.admin_phone || ''}
-                  onChange={(e) => setEditingCompany(prev => prev ? { ...prev, admin_phone: e.target.value } : null)}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Admin WhatsApp</label>
-                <input
-                  type="tel"
-                  value={editingCompany.admin_whatsapp || ''}
-                  onChange={(e) => setEditingCompany(prev => prev ? { ...prev, admin_whatsapp: e.target.value } : null)}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
+                <div className="flex items-center justify-between mb-2">
+                  <label className="block text-sm font-medium text-gray-700">Firm Admins</label>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setEditingCompany(prev => prev ? {
+                      ...prev,
+                      firm_admins: [...(prev.firm_admins ?? []), { full_name: '', email: '', phone: '', whatsapp: '' }]
+                    } : null)}
+                  >
+                    <Plus className="w-4 h-4 mr-1" />
+                    Add firm admin
+                  </Button>
+                </div>
+                {(editingCompany.firm_admins ?? []).map((admin, idx) => (
+                  <div key={admin.id ?? `new-${idx}`} className="mb-4 p-3 border border-gray-200 rounded-md bg-gray-50/50 space-y-2">
+                    <div className="flex justify-between items-center mb-2">
+                      <span className="text-xs font-medium text-gray-600">Firm admin {idx + 1}</span>
+                      {(editingCompany.firm_admins?.length ?? 0) > 1 && (
+                        <button
+                          type="button"
+                          onClick={() => setEditingCompany(prev => prev ? {
+                            ...prev,
+                            firm_admins: prev.firm_admins?.filter((_, i) => i !== idx) ?? []
+                          } : null)}
+                          className="text-red-600 hover:text-red-800 p-1"
+                          aria-label="Remove firm admin"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
+                    <div>
+                      <input
+                        type="text"
+                        value={admin.full_name || ''}
+                        onChange={(e) => setEditingCompany(prev => prev ? {
+                          ...prev,
+                          firm_admins: (prev.firm_admins ?? []).map((a, i) => i === idx ? { ...a, full_name: e.target.value } : a)
+                        } : null)}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                        placeholder="Name"
+                      />
+                    </div>
+                    <div>
+                      <input
+                        type="email"
+                        value={admin.email || ''}
+                        onChange={(e) => setEditingCompany(prev => prev ? {
+                          ...prev,
+                          firm_admins: (prev.firm_admins ?? []).map((a, i) => i === idx ? { ...a, email: e.target.value } : a)
+                        } : null)}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                        placeholder="Email *"
+                      />
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        type="tel"
+                        value={admin.phone || ''}
+                        onChange={(e) => setEditingCompany(prev => prev ? {
+                          ...prev,
+                          firm_admins: (prev.firm_admins ?? []).map((a, i) => i === idx ? { ...a, phone: e.target.value } : a)
+                        } : null)}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                        placeholder="Phone"
+                      />
+                      <input
+                        type="tel"
+                        value={admin.whatsapp || ''}
+                        onChange={(e) => setEditingCompany(prev => prev ? {
+                          ...prev,
+                          firm_admins: (prev.firm_admins ?? []).map((a, i) => i === idx ? { ...a, whatsapp: e.target.value } : a)
+                        } : null)}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                        placeholder="WhatsApp"
+                      />
+                    </div>
+                  </div>
+                ))}
               </div>
 
               <div>
@@ -1188,6 +1427,23 @@ const SuperAdminDashboard = () => {
                   placeholder="e.g. 60 or 90"
                 />
                 <p className="text-xs text-gray-500 mt-1">Equipment tab stays locked for this many days after onboarding.</p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Max equipment limit (optional)</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={editingCompany.max_equipment_limit ?? ''}
+                  onChange={(e) => {
+                    const v = e.target.value === '' ? null : parseInt(e.target.value, 10);
+                    const num = v === null ? null : (isNaN(v as number) ? 0 : Math.max(0, v as number));
+                    setEditingCompany(prev => prev ? { ...prev, max_equipment_limit: num } : null);
+                  }}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  placeholder="Unlimited if empty"
+                />
+                <p className="text-xs text-gray-500 mt-1">Total equipment (project + standalone) this company can create. Leave empty for unlimited.</p>
               </div>
 
               {/* Company Logo Upload */}

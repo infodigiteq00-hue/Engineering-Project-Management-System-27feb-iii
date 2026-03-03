@@ -191,7 +191,8 @@ const StandaloneEquipmentCard: React.FC<StandaloneEquipmentCardProps> = (props) 
   // Updates tab: load entry image only when user clicks preview (metadata first)
   const [progressEntryImageUrls, setProgressEntryImageUrls] = React.useState<Record<string, string>>({});
   const [progressEntryImageLoading, setProgressEntryImageLoading] = React.useState<Record<string, boolean>>({});
-  
+  const [docsSearchQuery, setDocsSearchQuery] = React.useState('');
+
   const {
     item,
     editingEquipmentId,
@@ -2604,6 +2605,16 @@ const StandaloneEquipmentCard: React.FC<StandaloneEquipmentCardProps> = (props) 
                                 Add Document
                               </Button>
                             </div>
+                            <div className="relative mb-2">
+                              <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400" />
+                              <input
+                                type="text"
+                                placeholder="Search documents..."
+                                value={docsSearchQuery}
+                                onChange={(e) => setDocsSearchQuery(e.target.value)}
+                                className="w-full pl-8 pr-3 py-1.5 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                              />
+                            </div>
                             <div className="max-h-[200px] sm:h-36 overflow-y-auto border border-gray-200 rounded bg-gray-50 p-2 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
                               {(() => {
                                 // // console.log('ðŸ“„ PERFECT: Rendering documents for equipment:', item.id);
@@ -2620,10 +2631,17 @@ const StandaloneEquipmentCard: React.FC<StandaloneEquipmentCardProps> = (props) 
                                   <Skeleton className="h-4 w-1/2" />
                                 </div>
                               ) : (() => {
-                                // Filter to show Equipment Documents and VDCR Approved Documents in the Docs tab
-                                const equipmentDocs = documents[item.id]?.filter((doc: any) => 
+                                // Filter to show Equipment Documents and VDCR Approved Documents in the Docs tab; then by search
+                                const equipmentDocs = (documents[item.id]?.filter((doc: any) =>
                                   doc.document_type === 'Equipment Document' || doc.document_type === 'VDCR Approved Document'
-                                ) || [];
+                                ) || [])
+                                  .filter((doc: any) => {
+                                    const q = docsSearchQuery.trim().toLowerCase();
+                                    if (!q) return true;
+                                    const name = (doc.document_name || doc.name || '').toLowerCase();
+                                    const type = (doc.document_type || '').toLowerCase();
+                                    return name.includes(q) || type.includes(q);
+                                  });
                                 
                                 if (equipmentDocs.length === 0) {
                                   return (
@@ -2898,180 +2916,4 @@ const StandaloneEquipmentCard: React.FC<StandaloneEquipmentCardProps> = (props) 
 };
 
 export default StandaloneEquipmentCard;
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold text-gray-800">Progress Image</h3>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => {
-                  setShowImagePreview(null);
-                }}
-                className="text-gray-500 hover:text-gray-700"
-              >
-                <X size={20} />
-              </Button>
-            </div>
-            <div className="relative">
-              {/* Image with Navigation Overlay */}
-              <div className="relative">
-                <img
-                  src={showImagePreview.url}
-                  alt="Progress"
-                  className="w-full h-auto rounded-lg border border-gray-200"
-                />
-
-                {/* Image Navigation - Left/Right Sides like Carousel */}
-                {(() => {
-                  const currentEquipment = localEquipment.find(eq => eq.id === showImagePreview.equipmentId);
-                  const images = currentEquipment?.progressImages || []; // Use progressImages instead of images
-
-
-                  if (images.length > 1) {
-                    return (
-                      <>
-                        {/* Left Navigation Button */}
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            const prevIndex = showImagePreview.currentIndex > 0 ? showImagePreview.currentIndex - 1 : images.length - 1;
-                            setShowImagePreview({ url: images[prevIndex], equipmentId: showImagePreview.equipmentId, currentIndex: prevIndex });
-                            // Sync with card view
-                            setCurrentProgressImageIndex(prev => ({
-                              ...prev,
-                              [showImagePreview.equipmentId]: prevIndex
-                            }));
-                          }}
-                          className="absolute left-4 top-1/2 transform -translate-y-1/2 bg-white/90 hover:bg-white border-gray-300 shadow-lg"
-                        >
-                          <ChevronLeft size={20} />
-                        </Button>
-
-                        {/* Right Navigation Button */}
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            const nextIndex = showImagePreview.currentIndex < images.length - 1 ? showImagePreview.currentIndex + 1 : 0;
-                            setShowImagePreview({ url: images[nextIndex], equipmentId: showImagePreview.equipmentId, currentIndex: nextIndex });
-                            // Sync with card view
-                            setCurrentProgressImageIndex(prev => ({
-                              ...prev,
-                              [showImagePreview.equipmentId]: nextIndex
-                            }));
-                          }}
-                          className="absolute right-4 top-1/2 transform -translate-y-1/2 bg-white/90 hover:bg-white border-gray-300 shadow-lg"
-                        >
-                          <ChevronRight size={20} />
-                        </Button>
-
-                        {/* Image Counter - Top Center */}
-                        <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-black/70 text-white px-3 py-1 rounded-full text-sm">
-                          {showImagePreview.currentIndex + 1} of {images.length}
-                        </div>
-                      </>
-                    );
-                  }
-                  return null;
-                })()}
-              </div>
-
-              <div className="space-y-2 mt-4">
-                <div className="text-sm text-gray-600">
-                  <strong>Description:</strong> {(() => {
-                    const currentEquipment = localEquipment.find(eq => eq.id === showImagePreview.equipmentId);
-                    const metadata = currentEquipment?.progressImagesMetadata || [];
-                    const currentMetadata = metadata[showImagePreview.currentIndex];
-
-                    return currentMetadata?.description || "Progress image";
-                  })()}
-                </div>
-                <div className="text-sm text-gray-600">
-                  <strong>Uploaded by:</strong> {(() => {
-                    const currentEquipment = localEquipment.find(eq => eq.id === showImagePreview.equipmentId);
-                    const metadata = currentEquipment?.progressImagesMetadata || [];
-                    const currentMetadata = metadata[showImagePreview.currentIndex];
-
-                    return currentMetadata?.uploaded_by || "Team Member";
-                  })()}
-                </div>
-                <div className="text-sm text-gray-600">
-                  <strong>Date:</strong> {(() => {
-                    const currentEquipment = localEquipment.find(eq => eq.id === showImagePreview.equipmentId);
-                    const metadata = currentEquipment?.progressImagesMetadata || [];
-                    const currentMetadata = metadata[showImagePreview.currentIndex];
-
-                    if (currentMetadata?.upload_date) {
-                      const date = new Date(currentMetadata.upload_date);
-                      return date.toLocaleString('en-US', {
-                        year: 'numeric',
-                        month: '2-digit',
-                        day: '2-digit',
-                        hour: '2-digit',
-                        minute: '2-digit',
-                        second: '2-digit',
-                        hour12: true,
-                        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone
-                      });
-                    }
-                    return new Date().toLocaleString('en-US', {
-                      year: 'numeric',
-                      month: '2-digit',
-                      day: '2-digit',
-                      hour: '2-digit',
-                      minute: '2-digit',
-                      second: '2-digit',
-                      hour12: true,
-                      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone
-                    });
-                  })()}
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Document Preview Modal */}
-      {documentPreview && (
-        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg p-6 max-w-4xl w-full mx-4 max-h-[90vh] overflow-y-auto">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold text-gray-800">Document: {documentPreview.name}</h3>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    // Create a download link for the file
-                    const url = URL.createObjectURL(documentPreview.file);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = documentPreview.name;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    URL.revokeObjectURL(url);
-                  }}
-                  className="bg-green-600 hover:bg-green-700 text-white"
-                >
-                  <FileText size={16} className="mr-2" />
-                  Download
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setDocumentPreview(null)}
-                  className="text-gray-500 hover:text-gray-700"
-                >
-                  <X size={20} />
-                </Button>
-              </div>
-            </div>
-
-            <div className="space-y-4">
-    </Card>
-  );
-};
-
-export default StandaloneEquipmentCard;
+           

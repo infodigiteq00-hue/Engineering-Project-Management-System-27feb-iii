@@ -140,6 +140,33 @@ export const fastAPI = {
     }
   },
 
+  /** Total equipment count for a firm: project equipment (all projects) + standalone equipment (created by firm users). */
+  async getEquipmentCountByFirm(firmId: string): Promise<number> {
+    try {
+      const [projectsRes, usersRes] = await Promise.all([
+        api.get(`/projects?firm_id=eq.${firmId}&select=id`),
+        api.get(`/users?firm_id=eq.${firmId}&select=id`)
+      ]);
+      const projectIds = (projectsRes.data as any[])?.map((p: any) => p.id).filter(Boolean) || [];
+      const userIds = (usersRes.data as any[])?.map((u: any) => u.id).filter(Boolean) || [];
+
+      let projectEquipmentCount = 0;
+      let standaloneCount = 0;
+      if (projectIds.length > 0) {
+        const eqRes = await api.get(`/equipment?project_id=in.(${projectIds.join(',')})&select=id`);
+        projectEquipmentCount = Array.isArray(eqRes.data) ? eqRes.data.length : 0;
+      }
+      if (userIds.length > 0) {
+        const standRes = await api.get(`/standalone_equipment?created_by=in.(${userIds.join(',')})&select=id`);
+        standaloneCount = Array.isArray(standRes.data) ? standRes.data.length : 0;
+      }
+      return projectEquipmentCount + standaloneCount;
+    } catch (error) {
+      console.error('❌ Error fetching equipment count by firm:', error);
+      return 0;
+    }
+  },
+
   // Fetch all users
   async getUsers() {
     try {
@@ -1048,17 +1075,34 @@ export const fastAPI = {
 
   async createEquipment(equipmentData: any) {
     try {
+      const projectId = equipmentData.project_id;
+      if (projectId) {
+        const projectRes = await api.get(`/projects?id=eq.${projectId}&select=firm_id`);
+        const project = (projectRes.data as any[])?.[0];
+        const firmId = project?.firm_id;
+        if (firmId) {
+          const firm = await fastAPI.getFirmById(firmId);
+          const limit = firm?.max_equipment_limit;
+          if (limit != null && typeof limit === 'number') {
+            const count = await fastAPI.getEquipmentCountByFirm(firmId);
+            if (count >= limit) {
+              throw new Error(`Equipment limit reached (${count}/${limit}). Your company cannot add more equipment. Contact your super admin to increase the limit.`);
+            }
+          }
+        }
+      }
+
       // Normalize values before checking (trim whitespace, handle empty strings)
       const tagNumber = equipmentData.tag_number?.trim() || '';
       const jobNumber = equipmentData.job_number?.trim() || '';
       const manufacturingSerial = equipmentData.manufacturing_serial?.trim() || '';
-      
+
       // // console.log('🔍 Checking uniqueness for equipment:', {
       //   tag_number: tagNumber,
       //   job_number: jobNumber,
       //   manufacturing_serial: manufacturingSerial
       // });
-      
+
       // Check for global uniqueness before creating
       // Only check non-empty values to avoid false positives
       const uniquenessCheck = await fastAPI.checkEquipmentUniqueness(
@@ -1066,15 +1110,15 @@ export const fastAPI = {
         jobNumber || undefined,
         manufacturingSerial || undefined
       );
-      
+
       // // console.log('🔍 Uniqueness check result:', uniquenessCheck);
-      
+
       if (!uniquenessCheck.isUnique) {
         const errorMessage = `Cannot create equipment. ${uniquenessCheck.conflicts.join('. ')}. Each Tag Number, Job Number, and Manufacturing Serial Number must be unique across all projects.`;
         console.error('❌ Uniqueness validation failed:', errorMessage);
         throw new Error(errorMessage);
       }
-      
+
       // // console.log('✅ Uniqueness validation passed, creating equipment...');
       const response = await api.post('/equipment', equipmentData);
       // // console.log('✅ Equipment create API response:', response.data);
@@ -1948,22 +1992,33 @@ export const fastAPI = {
   },
 
   // Standalone Equipment CRUD operations
-  async createStandaloneEquipment(equipmentData: any) {
+  async createStandaloneEquipment(equipmentData: any, firmId?: string) {
     try {
       // Get current user ID to set as created_by (firm_id is determined via created_by -> users.firm_id)
       const userId = localStorage.getItem('userId');
       if (!userId) {
         throw new Error('Cannot create standalone equipment: user ID is required. Please ensure you are logged in.');
       }
-      
+
       // Set created_by to track who created the equipment (firm ownership determined via users.firm_id)
       equipmentData.created_by = userId;
-      
+
+      if (firmId) {
+        const firm = await fastAPI.getFirmById(firmId);
+        const limit = firm?.max_equipment_limit;
+        if (limit != null && typeof limit === 'number') {
+          const count = await fastAPI.getEquipmentCountByFirm(firmId);
+          if (count >= limit) {
+            throw new Error(`Equipment limit reached (${count}/${limit}). Your company cannot add more equipment. Contact your super admin to increase the limit.`);
+          }
+        }
+      }
+
       // Normalize values before checking (trim whitespace, handle empty strings)
       const tagNumber = equipmentData.tag_number?.trim() || '';
       const jobNumber = equipmentData.job_number?.trim() || '';
       const manufacturingSerial = equipmentData.manufacturing_serial?.trim() || '';
-      
+
       // Check for global uniqueness (across both equipment and standalone_equipment tables)
       const uniquenessCheck = await fastAPI.checkEquipmentUniqueness(
         tagNumber || undefined,
